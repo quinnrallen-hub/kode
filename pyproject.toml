@@ -1,0 +1,16 @@
+[project]
+name = "kode"
+version = "0.3.0"
+description = "A TUI agentic coding tool powered by OpenRouter"
+requires-python = ">=3.11"
+dependencies = ["requests", "rich", "prompt_toolkit"]
+
+[project.scripts]
+kode = "agent:main"
+
+[build-system]
+requires = ["setuptools>=61"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools]
+py-modules = ["agent", "tools", "checkpoint"]

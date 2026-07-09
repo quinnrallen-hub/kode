@@ -1,0 +1,5 @@
+#!/usr/bin/env bash
+# Launcher for kode. Runs the agent from anywhere; workspace defaults to CWD.
+# readlink -f resolves symlinks so it works when linked into ~/.local/bin.
+DIR="$(cd "$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")" && pwd)"
+exec python3 "$DIR/agent.py" "$@"

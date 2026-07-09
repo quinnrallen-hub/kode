@@ -1,0 +1,15 @@
+# Python
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.mypy_cache/
+*.egg-info/
+build/
+dist/
+
+# kode runtime artifacts
+.kode-jobs/
+kode-transcript-*.md
+
+# unrelated local scratch script (not part of kode)
+timer.py
