@@ -24,6 +24,16 @@ class Checkpointer:
         self.git_dir = Path(home) / "shadow" / slug
         self.enabled = which("git") is not None
         self.reason = "" if self.enabled else "git not installed"
+        # Refuse to snapshot an unbounded tree (home dir, filesystem root): a
+        # `git add -A` there would index everything under it — huge and slow, and
+        # would sweep in caches/secrets. Checkpoints just switch off; kode still
+        # runs, you only lose per-turn file rollback in that directory.
+        if self.enabled and os.environ.get("KODE_ALLOW_BROAD_CKPT") != "1":
+            broad = {Path.home().resolve(), Path(self.workspace.anchor).resolve()}
+            if self.workspace in broad and not (self.workspace / ".git").exists():
+                self.enabled = False
+                self.reason = ("workspace is your home/root dir — checkpoints off "
+                               "(set KODE_ALLOW_BROAD_CKPT=1 to force)")
 
     # -- low-level ---------------------------------------------------------- #
     def _git(self, *args: str, check: bool = False) -> subprocess.CompletedProcess:

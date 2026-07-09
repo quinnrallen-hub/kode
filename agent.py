@@ -1793,7 +1793,7 @@ def main() -> None:
     model_label = ("auto-route" if agent.auto_route else
                    agent.model.split("/")[-1])
     ck_on = agent.checkpointer and agent.checkpointer.enabled
-    ckpt = "[green]● checkpoints[/green]" if ck_on else "[dim]○ no git[/dim]"
+    ckpt = "[green]● checkpoints[/green]" if ck_on else "[dim]○ no checkpoints[/dim]"
     n_saved = len(sessions_meta())
 
     rows = [
@@ -1801,6 +1801,8 @@ def main() -> None:
         f"[dim]dir  [/dim] {tools.WORKSPACE}",
         f"[dim]model[/dim] [green]{model_label}[/green]   {mode}   {ckpt}",
     ]
+    if not ck_on and agent.checkpointer and agent.checkpointer.reason:
+        rows.append(f"[dim]○ {agent.checkpointer.reason}[/dim]")
     if n_saved:
         rows.append(f"[dim]{n_saved} saved session(s) · /resume to reopen[/dim]")
     rows.append("[dim]/help for commands · @file to attach · Ctrl-C stop · Ctrl-D quit[/dim]")

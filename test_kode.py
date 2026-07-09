@@ -573,6 +573,26 @@ def test_context_limit_env_pin_wins(monkeypatch):
 # --------------------------------------------------------------------------- #
 # transcript export
 # --------------------------------------------------------------------------- #
+def test_checkpointer_disabled_in_home(tmp_path, monkeypatch):
+    import checkpoint
+    monkeypatch.delenv("KODE_ALLOW_BROAD_CKPT", raising=False)
+    monkeypatch.setattr(checkpoint.Path, "home", classmethod(lambda cls: tmp_path))
+    ck = checkpoint.Checkpointer(tmp_path, tmp_path / "cfg")
+    assert ck.enabled is False
+    assert "home" in ck.reason
+
+
+def test_checkpointer_enabled_in_subdir(tmp_path, monkeypatch):
+    import checkpoint
+    monkeypatch.delenv("KODE_ALLOW_BROAD_CKPT", raising=False)
+    monkeypatch.setattr(checkpoint.Path, "home", classmethod(lambda cls: tmp_path))
+    sub = tmp_path / "project"
+    sub.mkdir()
+    ck = checkpoint.Checkpointer(sub, tmp_path / "cfg")
+    # enabled iff git is installed; the broad-workspace guard must NOT trip here
+    assert ck.reason == "" or "git not installed" in ck.reason
+
+
 def test_export_writes_markdown(ws):
     a = _agent()
     a.messages += [{"role": "user", "content": "do a thing"},
