@@ -11,20 +11,22 @@ import html
 import ipaddress
 import os
 import re
+import signal
 import socket
 import subprocess
 import sys
 import threading
 import time
 from pathlib import Path
-from urllib.parse import unquote, urlparse
+from urllib.parse import unquote, urljoin, urlparse
 
 import requests
 
 # Root the agent is allowed to touch. Defaults to CWD at import time.
 WORKSPACE = Path(os.environ.get("KODE_WORKSPACE", os.getcwd())).resolve()
 
-MAX_READ_BYTES = 400_000       # refuse to read files larger than this
+MAX_READ_BYTES = 400_000       # refuse a *full* read of files larger than this
+MAX_READ_HARD_CAP = 50_000_000  # never load a file bigger than this, even sliced
 MAX_OUTPUT_CHARS = 20_000
 MAX_FETCH_BYTES = 5_000_000    # cap on fetch_url download size
 
@@ -125,9 +127,16 @@ def read_file(path: str, offset: int = 0, limit: int = 2000) -> str:
         return (f"ERROR: {path} looks like a secrets file; refusing to send its "
                 f"contents. Set KODE_ALLOW_SECRETS=1 to override.")
     size = p.stat().st_size
-    if size > MAX_READ_BYTES:
+    # Only refuse a *full* read of a big file; an explicit offset/limit slice is
+    # allowed (and bounded again by _clip below), so the model isn't told to do
+    # something the guard would keep rejecting.
+    explicit_slice = offset > 0 or limit < 2000
+    if size > MAX_READ_BYTES and not explicit_slice:
         return (f"ERROR: {path} is {size} bytes (> {MAX_READ_BYTES}); read a slice "
-                f"with offset/limit or grep it instead.")
+                f"with offset/limit (e.g. offset=0, limit=200) or grep it instead.")
+    if size > MAX_READ_HARD_CAP:
+        return (f"ERROR: {path} is {size} bytes (> {MAX_READ_HARD_CAP}); too large to "
+                f"read even sliced — grep it for what you need.")
     _touch(p)
     data = p.read_text(errors="replace").splitlines()
     chunk = data[offset : offset + limit]
@@ -244,10 +253,12 @@ def bash(command: str, timeout: int = 120, background: bool = False) -> str:
         logdir = WORKSPACE / ".kode-jobs"
         logdir.mkdir(exist_ok=True)
         _clean_jobs(logdir)
-        log = logdir / f"job-{int(time.time())}.log"
+        log = logdir / f"job-{time.time_ns()}.log"  # ns → no same-second collision
         fh = open(log, "w")
         p = subprocess.Popen(command, shell=True, cwd=str(WORKSPACE),
-                             stdout=fh, stderr=subprocess.STDOUT)
+                             stdout=fh, stderr=subprocess.STDOUT,
+                             start_new_session=True)
+        fh.close()  # the child holds its own dup; the parent doesn't need this one
         JOBS.append({"pid": p.pid, "command": command, "log": log, "proc": p})
         rel = os.path.relpath(log, WORKSPACE)
         return (f"started in background (pid {p.pid}); output streaming to {rel}. "
@@ -260,15 +271,18 @@ def _run_foreground(command: str, timeout: int) -> str:
 
     A watchdog thread enforces the timeout even if the command produces no
     output. Set KODE_BASH_QUIET=1 to suppress the live echo."""
+    # start_new_session=True puts the command in its own process group so the
+    # watchdog can kill the whole tree — a grandchild holding the pipe open would
+    # otherwise keep us blocked in the read loop long past the timeout.
     proc = subprocess.Popen(command, shell=True, cwd=str(WORKSPACE),
                             stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
-                            text=True, bufsize=1)
+                            text=True, bufsize=1, start_new_session=True)
     timed_out = threading.Event()
 
     def _kill():
         timed_out.set()
         try:
-            proc.kill()
+            os.killpg(proc.pid, signal.SIGKILL)
         except OSError:
             pass
 
@@ -402,13 +416,28 @@ def fetch_url(url: str, max_chars: int = 12000) -> str:
     """Fetch a public URL; HTML is crudely stripped to text."""
     if not url.startswith(("http://", "https://")):
         return "ERROR: url must start with http(s)://"
-    host = urlparse(url).hostname or ""
-    if os.environ.get("KODE_ALLOW_LOCAL_FETCH") != "1" and not _is_public_host(host):
-        return (f"ERROR: refusing to fetch {host} (private/loopback address). "
-                f"Set KODE_ALLOW_LOCAL_FETCH=1 to override.")
+    allow_local = os.environ.get("KODE_ALLOW_LOCAL_FETCH") == "1"
     try:
-        r = requests.get(url, timeout=30, stream=True,
-                         headers={"User-Agent": "kode/1.0"})
+        # Follow redirects by hand, re-checking the host at every hop: otherwise a
+        # public URL could 302 us to http://169.254.169.254/ or a loopback service.
+        r = None
+        for _ in range(6):
+            host = urlparse(url).hostname or ""
+            if not allow_local and not _is_public_host(host):
+                return (f"ERROR: refusing to fetch {host} (private/loopback address). "
+                        f"Set KODE_ALLOW_LOCAL_FETCH=1 to override.")
+            r = requests.get(url, timeout=30, stream=True, allow_redirects=False,
+                             headers={"User-Agent": "kode/1.0"})
+            if r.is_redirect and r.headers.get("location"):
+                nxt = urljoin(url, r.headers["location"])
+                r.close()
+                if not nxt.startswith(("http://", "https://")):
+                    return "ERROR: redirect to a non-http(s) URL blocked"
+                url = nxt
+                continue
+            break
+        else:
+            return "ERROR: too many redirects"
         chunks, total = [], 0
         for c in r.iter_content(8192, decode_unicode=False):
             chunks.append(c)
@@ -483,8 +512,10 @@ def undo_last() -> str:
     if prev is None:
         if p.exists():
             p.unlink()
+        _READ_MTIMES.pop(str(p), None)
         return f"removed {rel} (was newly created)"
     p.write_text(prev)
+    _touch(p)  # keep the stale-guard from flagging our own revert as an outside edit
     return f"reverted {rel}"
 
 

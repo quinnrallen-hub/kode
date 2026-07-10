@@ -55,6 +55,11 @@ class Checkpointer:
             info = self.git_dir / "info"
             info.mkdir(exist_ok=True)
             (info / "exclude").write_text("\n".join(_EXCLUDES) + "\n")
+        else:
+            # The shadow repo gains a commit every turn and is never pruned; let
+            # git repack/expire loose objects once per session so it can't grow
+            # without bound. --auto no-ops until git's own thresholds are crossed.
+            self._git("gc", "--auto", "--quiet")
         self.snapshot("session start")
         return True
 
