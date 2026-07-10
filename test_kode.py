@@ -647,3 +647,200 @@ def test_export_writes_markdown(ws):
     body = (ws / "out.md").read_text()
     assert "do a thing" in body and "did the thing" in body
     assert body.startswith("# kode transcript")
+
+
+# --------------------------------------------------------------------------- #
+# fetchers (offline; HTTP stubbed like web_search / fetch_url tests)
+# --------------------------------------------------------------------------- #
+class _Resp:
+    """Minimal stand-in for a requests.Response."""
+    def __init__(self, *, status=200, json_data=None, text="", content=b"",
+                 content_type="application/json"):
+        self.status_code = status
+        self._json = json_data
+        self.text = text
+        self.content = content
+        self.headers = {"content-type": content_type}
+        self.is_redirect = False
+    def json(self):
+        if self._json is None:
+            raise ValueError("no json")
+        return self._json
+    def close(self):
+        pass
+    def iter_content(self, n, decode_unicode=False):
+        yield self.content
+
+
+def _stub_get(monkeypatch, fn):
+    monkeypatch.setattr(tools.requests, "get", fn)
+
+
+def _boom(*a, **k):
+    raise tools.requests.RequestException("network down")
+
+
+# fetch_github ---------------------------------------------------------------
+def test_fetch_github_file(monkeypatch):
+    import base64
+    body = base64.b64encode(b"print('hi')").decode()
+    monkeypatch.setattr(tools, "_gh_headers", lambda: {})
+    _stub_get(monkeypatch, lambda *a, **k: _Resp(
+        json_data={"encoding": "base64", "content": body}))
+    out = tools.fetch_github("o/r", kind="file", path="a.py")
+    assert "print('hi')" in out
+
+
+def test_fetch_github_network_error(monkeypatch):
+    monkeypatch.setattr(tools, "_gh_headers", lambda: {})
+    _stub_get(monkeypatch, _boom)
+    assert tools.fetch_github("o/r", kind="releases").startswith("ERROR")
+
+
+# fetch_docs -----------------------------------------------------------------
+def test_fetch_docs_pypi(monkeypatch):
+    _stub_get(monkeypatch, lambda *a, **k: _Resp(json_data={
+        "info": {"name": "requests", "version": "2.31.0",
+                 "summary": "HTTP for Humans", "description": "long desc"}}))
+    out = tools.fetch_docs("requests", ecosystem="pypi")
+    assert "requests 2.31.0" in out and "HTTP for Humans" in out
+
+
+def test_fetch_docs_network_error(monkeypatch):
+    _stub_get(monkeypatch, _boom)
+    assert tools.fetch_docs("requests", ecosystem="pypi").startswith("ERROR")
+
+
+# fetch_error ----------------------------------------------------------------
+def test_fetch_error_parses(monkeypatch):
+    data = {"items": [{"score": 42, "title": "Why &amp; how", "is_answered": True,
+                       "link": "https://stackoverflow.com/q/1"}]}
+    _stub_get(monkeypatch, lambda *a, **k: _Resp(json_data=data))
+    out = tools.fetch_error("some error")
+    assert "Why & how" in out and "answered" in out and "[42]" in out
+
+
+def test_fetch_error_network_error(monkeypatch):
+    _stub_get(monkeypatch, _boom)
+    assert tools.fetch_error("x").startswith("ERROR")
+
+
+# fetch_readme ---------------------------------------------------------------
+def test_fetch_readme_github(monkeypatch):
+    import base64
+    monkeypatch.setattr(tools, "_gh_headers", lambda: {})
+    _stub_get(monkeypatch, lambda *a, **k: _Resp(
+        json_data={"content": base64.b64encode(b"# Title\nhello").decode()}))
+    out = tools.fetch_readme("o/r")
+    assert "# Title" in out and "hello" in out
+
+
+def test_fetch_readme_network_error(monkeypatch):
+    _stub_get(monkeypatch, _boom)
+    assert tools.fetch_readme("pkgname").startswith("ERROR")
+
+
+# fetch_json -----------------------------------------------------------------
+def test_fetch_json_keypath(monkeypatch):
+    r = _Resp(json_data={"items": [{"name": "first"}, {"name": "second"}]})
+    monkeypatch.setattr(tools, "_safe_get", lambda *a, **k: r)
+    out = tools.fetch_json("https://x/y", keypath="items[1].name")
+    assert "second" in out
+
+
+def test_fetch_json_network_error(monkeypatch):
+    monkeypatch.setattr(tools, "_safe_get", lambda *a, **k: "ERROR: down")
+    assert tools.fetch_json("https://x/y").startswith("ERROR")
+
+
+# fetch_mdn ------------------------------------------------------------------
+def test_fetch_mdn_parses(monkeypatch):
+    data = {"documents": [{"title": "Array.map", "mdn_url": "/en-US/x",
+                           "summary": "maps stuff"}]}
+    _stub_get(monkeypatch, lambda *a, **k: _Resp(json_data=data))
+    out = tools.fetch_mdn("array map")
+    assert "Array.map" in out and "developer.mozilla.org/en-US/x" in out
+
+
+def test_fetch_mdn_network_error(monkeypatch):
+    _stub_get(monkeypatch, _boom)
+    assert tools.fetch_mdn("x").startswith("ERROR")
+
+
+# fetch_wayback --------------------------------------------------------------
+def test_fetch_wayback_happy(monkeypatch):
+    avail = {"archived_snapshots": {"closest": {
+        "available": True, "url": "https://web.archive.org/snap",
+        "timestamp": "20200101"}}}
+    _stub_get(monkeypatch, lambda *a, **k: _Resp(json_data=avail))
+    monkeypatch.setattr(tools, "_safe_get", lambda *a, **k: _Resp(
+        text="<html><body>archived text</body></html>",
+        content_type="text/html"))
+    out = tools.fetch_wayback("https://example.com")
+    assert "archived text" in out and "20200101" in out
+
+
+def test_fetch_wayback_network_error(monkeypatch):
+    _stub_get(monkeypatch, _boom)
+    assert tools.fetch_wayback("https://example.com").startswith("ERROR")
+
+
+# fetch_rfc ------------------------------------------------------------------
+def test_fetch_rfc_slice(monkeypatch):
+    _stub_get(monkeypatch, lambda *a, **k: _Resp(
+        text="line0\nline1\nline2\nline3", content_type="text/plain"))
+    out = tools.fetch_rfc(2616, offset=1, limit=2)
+    assert "line1" in out and "line2" in out and "line3" not in out
+
+
+def test_fetch_rfc_network_error(monkeypatch):
+    _stub_get(monkeypatch, _boom)
+    assert tools.fetch_rfc(2616).startswith("ERROR")
+
+
+# fetch_manpage --------------------------------------------------------------
+def test_fetch_manpage_local_or_stub(monkeypatch):
+    import shutil
+    if shutil.which("man") is None:
+        _stub_get(monkeypatch, lambda *a, **k: _Resp(
+            text="<html>LS(1) list directory contents</html>",
+            content_type="text/html"))
+        out = tools.fetch_manpage("ls")
+    else:
+        out = tools.fetch_manpage("ls")
+    assert out and not out.startswith("ERROR")
+
+
+def test_fetch_manpage_web_fallback_network_error(monkeypatch):
+    # Force the local `man` to fail, then the web fallback to error.
+    def no_man(*a, **k):
+        raise FileNotFoundError("no man")
+    monkeypatch.setattr(tools.subprocess, "run", no_man)
+    monkeypatch.setattr(tools, "_safe_get", lambda *a, **k: "ERROR: down")
+    assert tools.fetch_manpage("definitely-not-a-command").startswith("ERROR")
+
+
+# fetch_pdf ------------------------------------------------------------------
+def test_fetch_pdf_missing_pypdf(monkeypatch):
+    import builtins
+    real_import = builtins.__import__
+    def fake_import(name, *a, **k):
+        if name == "pypdf":
+            raise ImportError("no pypdf")
+        return real_import(name, *a, **k)
+    monkeypatch.setattr(builtins, "__import__", fake_import)
+    out = tools.fetch_pdf("https://example.com/x.pdf")
+    assert out.startswith("ERROR") and "pip install pypdf" in out
+
+
+def test_fetch_pdf_network_error(monkeypatch):
+    import builtins, types
+    # Provide a stub pypdf so the import path succeeds, then fail the fetch.
+    real_import = builtins.__import__
+    def fake_import(name, *a, **k):
+        if name == "pypdf":
+            return types.SimpleNamespace(PdfReader=lambda *x, **y: None)
+        return real_import(name, *a, **k)
+    monkeypatch.setattr(builtins, "__import__", fake_import)
+    monkeypatch.setattr(tools, "_safe_get", lambda *a, **k: "ERROR: down")
+    assert tools.fetch_pdf("https://example.com/x.pdf").startswith("ERROR")

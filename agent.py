@@ -67,7 +67,9 @@ CONFIG_FILE = CONFIG_DIR / "config.json"
 KEY_FILE = CONFIG_DIR / "key"
 PROJECT_DOCS = ("KODE.md", "AGENTS.md", "CLAUDE.md")
 READONLY_TOOLS = {"read_file", "grep", "glob_files", "list_dir", "fetch_url",
-                  "web_search"}
+                  "web_search", "fetch_github", "fetch_docs", "fetch_error",
+                  "fetch_readme", "fetch_json", "fetch_mdn", "fetch_wayback",
+                  "fetch_rfc", "fetch_manpage", "fetch_pdf"}
 MAX_PARALLEL_AGENTS = 4
 
 # Curated models the agent is told it can switch to / delegate to. Any that
@@ -89,6 +91,7 @@ workspace directory. You solve real software tasks using the provided tools.
 Guidelines:
 - Inspect the project with read_file/grep/glob_files/list_dir before changing anything. Never guess file contents.
 - When you need current documentation, an error message's meaning, or a reference you don't know the URL for, use web_search, then fetch_url to read the best result.
+- Prefer the targeted fetchers when they fit: fetch_github (repo files/issues/PRs/releases), fetch_docs (PyPI/npm/crates metadata), fetch_error (Stack Overflow), fetch_readme, fetch_json, fetch_mdn, fetch_wayback, fetch_rfc, fetch_manpage, fetch_pdf.
 - For multi-step work, call todo_write with a short plan and keep it updated as you finish steps.
 - Prefer edit_file for surgical changes; multi_edit for several edits to one file; write_file for new files.
 - Verify your work by running tests or commands via bash when it makes sense. Use bash background=true for long-running processes.
@@ -701,7 +704,8 @@ class Agent:
         self.messages = out
 
     # ---- lightweight context pruning ------------------------------------- #
-    _READ_TOOLS = {"read_file", "grep", "glob_files", "list_dir", "fetch_url"}
+    _READ_TOOLS = {"read_file", "grep", "glob_files", "list_dir", "fetch_url",
+                   "fetch_json", "fetch_wayback", "fetch_pdf"}
 
     def prune_context(self, keep_recent: int = 8) -> None:
         """Stub out stale read/grep/list outputs to slow context growth.
@@ -849,8 +853,11 @@ class Agent:
         sub = [
             {"role": "system", "content":
              "You are a focused read-only research sub-agent. Investigate using "
-             "read_file/grep/glob_files/list_dir/web_search/fetch_url and return a "
-             "concise, concrete answer. You cannot modify files."},
+             "read_file/grep/glob_files/list_dir/web_search/fetch_url and the "
+             "targeted fetchers (fetch_github, fetch_docs, fetch_error, "
+             "fetch_readme, fetch_json, fetch_mdn, fetch_wayback, fetch_rfc, "
+             "fetch_manpage, fetch_pdf), then return a concise, concrete answer. "
+             "You cannot modify files."},
             {"role": "user", "content": task},
         ]
         spec = [t for t in tools.TOOLS_SPEC
@@ -1055,6 +1062,22 @@ def _render_tool_call(name: str, args: dict) -> None:
         detail = args.get("url", "")
     elif name == "web_search":
         detail = args.get("query", "")
+    elif name == "fetch_github":
+        detail = f"{args.get('repo','')}  {args.get('kind','file')} " \
+                 f"{args.get('path') or args.get('number') or ''}".strip()
+    elif name in ("fetch_docs", "fetch_readme"):
+        detail = args.get("package") or args.get("target", "")
+    elif name in ("fetch_error", "fetch_mdn"):
+        detail = args.get("query", "")
+    elif name in ("fetch_json", "fetch_wayback", "fetch_pdf"):
+        detail = args.get("url", "")
+        if name == "fetch_json" and args.get("keypath"):
+            detail += f"  ({args['keypath']})"
+    elif name == "fetch_rfc":
+        detail = f"RFC {args.get('number','')}"
+    elif name == "fetch_manpage":
+        sec = args.get("section", "")
+        detail = f"{args.get('name','')}({sec})" if sec else args.get("name", "")
     elif name == "spawn_agent":
         detail = args.get("task", "")[:80] + (
             f"  [{args['model']}]" if args.get("model") else "")
@@ -1073,7 +1096,10 @@ def _render_tool_call(name: str, args: dict) -> None:
 
 # Tools whose output is worth previewing a few lines of; others get a 1-line summary.
 _CONTENT_TOOLS = {"read_file", "grep", "glob_files", "list_dir", "bash",
-                  "fetch_url", "web_search", "spawn_agent", "spawn_agents"}
+                  "fetch_url", "web_search", "spawn_agent", "spawn_agents",
+                  "fetch_github", "fetch_docs", "fetch_error", "fetch_readme",
+                  "fetch_json", "fetch_mdn", "fetch_wayback", "fetch_rfc",
+                  "fetch_manpage", "fetch_pdf"}
 
 
 def _render_tool_result(name: str, result: str) -> None:

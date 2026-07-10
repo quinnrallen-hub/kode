@@ -227,6 +227,23 @@ a flaky network doesn't stall every lookup.)
 (read-only sub-agents, parallel, per-agent model) · `switch_model` (agent changes its
 own model) · `todo_write`
 
+### Fetchers
+
+Targeted retrieval from well-known sources (read-only; usable by sub-agents). Fixed-host
+API calls go direct; anything that then chases an arbitrary URL (e.g. a wayback snapshot)
+is routed through the same SSRF-guarded helper as `fetch_url`:
+
+- `fetch_github` — repo file contents, issues, PRs, or releases (`owner/repo`); uses `gh auth token` when present, keyless otherwise
+- `fetch_docs` — package metadata from PyPI / npm / crates.io (ecosystem auto-detected)
+- `fetch_error` — Stack Overflow search with links + accepted answer for the top hit
+- `fetch_readme` — README for a GitHub `owner/repo` or a PyPI package name
+- `fetch_json` — fetch JSON and drill in with a key path like `items[0].name`
+- `fetch_mdn` — MDN Web Docs search (JS/CSS/HTTP references)
+- `fetch_wayback` — closest Internet Archive snapshot of a URL, stripped to text
+- `fetch_rfc` — plain text of an IETF RFC by number (optional line slice)
+- `fetch_manpage` — Unix man page (local `man` first, then man7.org)
+- `fetch_pdf` — download a PDF and extract text (optional page range; needs `pypdf`)
+
 ## Install
 
 ```bash
@@ -239,7 +256,7 @@ Make sure `~/.local/bin` is on your `PATH`.
 ## Testing
 
 ```bash
-python3 -m pytest test_kode.py -q      # 66 tests, no network needed
+python3 -m pytest test_kode.py -q      # 86 tests, no network needed
 ```
 
 ## Config via env vars

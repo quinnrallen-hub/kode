@@ -412,11 +412,30 @@ def _is_public_host(host: str) -> bool:
     return True
 
 
-def fetch_url(url: str, max_chars: int = 12000) -> str:
-    """Fetch a public URL; HTML is crudely stripped to text."""
+def _strip_html(text: str) -> str:
+    """Crudely turn an HTML document into readable plain text."""
+    text = re.sub(r"(?is)<(script|style)[^>]*>.*?</\1>", " ", text)
+    text = re.sub(r"<[^>]+>", " ", text)
+    text = html.unescape(text)
+    text = re.sub(r"[ \t]+", " ", text)
+    text = re.sub(r"\n\s*\n+", "\n", text)
+    return text
+
+
+def _safe_get(url: str, *, timeout: int = 30, max_bytes: int = MAX_FETCH_BYTES,
+              headers: dict | None = None):
+    """Perform a GET on an arbitrary/user-influenced URL, safely.
+
+    Follows redirects by hand, re-checking the host at every hop (SSRF guard),
+    and caps the download at max_bytes. Returns a `requests.Response` whose body
+    is already collected, or a string starting with "ERROR:" on refusal/failure.
+    """
     if not url.startswith(("http://", "https://")):
         return "ERROR: url must start with http(s)://"
     allow_local = os.environ.get("KODE_ALLOW_LOCAL_FETCH") == "1"
+    hdrs = {"User-Agent": "kode/1.0"}
+    if headers:
+        hdrs.update(headers)
     try:
         # Follow redirects by hand, re-checking the host at every hop: otherwise a
         # public URL could 302 us to http://169.254.169.254/ or a loopback service.
@@ -426,8 +445,8 @@ def fetch_url(url: str, max_chars: int = 12000) -> str:
             if not allow_local and not _is_public_host(host):
                 return (f"ERROR: refusing to fetch {host} (private/loopback address). "
                         f"Set KODE_ALLOW_LOCAL_FETCH=1 to override.")
-            r = requests.get(url, timeout=30, stream=True, allow_redirects=False,
-                             headers={"User-Agent": "kode/1.0"})
+            r = requests.get(url, timeout=timeout, stream=True, allow_redirects=False,
+                             headers=hdrs)
             if r.is_redirect and r.headers.get("location"):
                 nxt = urljoin(url, r.headers["location"])
                 r.close()
@@ -442,17 +461,22 @@ def fetch_url(url: str, max_chars: int = 12000) -> str:
         for c in r.iter_content(8192, decode_unicode=False):
             chunks.append(c)
             total += len(c)
-            if total > MAX_FETCH_BYTES:
+            if total > max_bytes:
                 break
-        r._content = b"".join(chunks)  # let .text decode what we collected
+        r._content = b"".join(chunks)  # let .text/.content see what we collected
     except requests.RequestException as e:
         return f"ERROR: {e}"
+    return r
+
+
+def fetch_url(url: str, max_chars: int = 12000) -> str:
+    """Fetch a public URL; HTML is crudely stripped to text."""
+    r = _safe_get(url)
+    if isinstance(r, str):
+        return r
     text = r.text
     if "html" in r.headers.get("content-type", ""):
-        text = re.sub(r"(?is)<(script|style)[^>]*>.*?</\1>", " ", text)
-        text = re.sub(r"<[^>]+>", " ", text)
-        text = re.sub(r"[ \t]+", " ", text)
-        text = re.sub(r"\n\s*\n+", "\n", text)
+        text = _strip_html(text)
     text = text.strip()
     if len(text) > max_chars:
         text = text[:max_chars] + f"\n... [truncated, {len(text)} chars total]"
@@ -488,6 +512,385 @@ def web_search(query: str, max_results: int = 6) -> str:
         snip = snippets[i][:300] if i < len(snippets) else ""
         out.append(f"{i + 1}. {title}\n   {url}" + (f"\n   {snip}" if snip else ""))
     return "\n".join(out)
+
+
+# --------------------------------------------------------------------------- #
+# Fetchers — targeted retrieval from well-known APIs. Fixed-host API calls hit
+# requests directly (with a timeout); anything that then chases an arbitrary URL
+# (e.g. a wayback snapshot) goes through _safe_get so the SSRF guard applies.
+# --------------------------------------------------------------------------- #
+def _gh_headers() -> dict:
+    """GitHub API headers, with a token from `gh auth token` when available."""
+    h = {"User-Agent": "kode/1.0", "Accept": "application/vnd.github+json"}
+    try:
+        r = subprocess.run(["gh", "auth", "token"], capture_output=True,
+                           text=True, timeout=5)
+        tok = r.stdout.strip()
+        if r.returncode == 0 and tok:
+            h["Authorization"] = f"Bearer {tok}"
+    except Exception:  # noqa: BLE001 — gh missing/offline: fall back to keyless
+        pass
+    return h
+
+
+def fetch_github(repo: str, kind: str = "file", ref: str = "",
+                 path: str = "", number: int = 0) -> str:
+    """Fetch from api.github.com for owner/repo.
+
+    kind: file | issues | prs | releases. For kind=file, `path` is the in-repo
+    path (and `ref` an optional branch/tag/sha). For issues/prs, `number` fetches
+    a single one; otherwise the most recent are listed. Tries `gh auth token`."""
+    if "/" not in repo:
+        return "ERROR: repo must be 'owner/name'"
+    base = f"https://api.github.com/repos/{repo}"
+    if kind == "file":
+        if not path:
+            return "ERROR: kind=file needs a path"
+        url = f"{base}/contents/{path.lstrip('/')}"
+        if ref:
+            url += f"?ref={ref}"
+    elif kind == "issues":
+        url = f"{base}/issues/{number}" if number else f"{base}/issues?state=all&per_page=15"
+    elif kind == "prs":
+        url = f"{base}/pulls/{number}" if number else f"{base}/pulls?state=all&per_page=15"
+    elif kind == "releases":
+        url = f"{base}/releases?per_page=10"
+    else:
+        return "ERROR: kind must be file | issues | prs | releases"
+    try:
+        r = requests.get(url, timeout=30, headers=_gh_headers())
+    except requests.RequestException as e:
+        return f"ERROR: {e}"
+    if r.status_code == 404:
+        return f"ERROR: not found (404): {repo} {kind} {path or number}"
+    if r.status_code != 200:
+        return f"ERROR: GitHub returned HTTP {r.status_code}: {r.text[:200]}"
+    try:
+        data = r.json()
+    except ValueError:
+        return f"ERROR: non-JSON response from GitHub"
+    if kind == "file":
+        import base64
+        if isinstance(data, list):
+            return _clip("\n".join(f"{e['type']:5} {e['name']}" for e in data))
+        if data.get("encoding") == "base64":
+            try:
+                body = base64.b64decode(data["content"]).decode("utf-8", "replace")
+            except Exception:  # noqa: BLE001
+                return "ERROR: could not decode file content"
+            return _clip(body)
+        return _clip(str(data.get("content", "")))
+    if isinstance(data, dict):  # single issue/pr
+        return _clip(f"#{data.get('number')} {data.get('title')} "
+                     f"[{data.get('state')}]\n{data.get('html_url')}\n\n"
+                     f"{data.get('body') or ''}")
+    if kind == "releases":
+        lines = [f"{d.get('tag_name')}  {d.get('name') or ''}  ({d.get('published_at','')[:10]})"
+                 for d in data]
+        return _clip("\n".join(lines)) or "(no releases)"
+    lines = [f"#{d.get('number')} [{d.get('state')}] {d.get('title')}  {d.get('html_url')}"
+             for d in data]
+    return _clip("\n".join(lines)) or "(none)"
+
+
+def fetch_docs(package: str, ecosystem: str = "") -> str:
+    """Fetch package registry metadata: PyPI, npm, or crates.io.
+
+    If ecosystem is omitted, tries pypi, then npm, then crates."""
+    order = [ecosystem] if ecosystem else ["pypi", "npm", "crates"]
+    errs = []
+    for eco in order:
+        if eco == "pypi":
+            url = f"https://pypi.org/pypi/{package}/json"
+        elif eco == "npm":
+            url = f"https://registry.npmjs.org/{package}"
+        elif eco == "crates":
+            url = f"https://crates.io/api/v1/crates/{package}"
+        else:
+            return "ERROR: ecosystem must be pypi | npm | crates"
+        try:
+            r = requests.get(url, timeout=30, headers={"User-Agent": "kode/1.0"})
+        except requests.RequestException as e:
+            errs.append(f"{eco}: {e}")
+            continue
+        if r.status_code != 200:
+            errs.append(f"{eco}: HTTP {r.status_code}")
+            continue
+        try:
+            d = r.json()
+        except ValueError:
+            errs.append(f"{eco}: non-JSON")
+            continue
+        if eco == "pypi":
+            info = d.get("info", {})
+            return _clip(f"{info.get('name')} {info.get('version')} (PyPI)\n"
+                         f"{info.get('summary') or ''}\n"
+                         f"Home: {info.get('home_page') or info.get('project_url') or ''}\n"
+                         f"Requires-Python: {info.get('requires_python') or '-'}\n"
+                         f"License: {info.get('license') or '-'}\n\n"
+                         f"{(info.get('description') or '')[:4000]}")
+        if eco == "npm":
+            latest = (d.get("dist-tags") or {}).get("latest", "")
+            ver = (d.get("versions") or {}).get(latest, {})
+            return _clip(f"{d.get('name')} {latest} (npm)\n"
+                         f"{d.get('description') or ''}\n"
+                         f"Home: {d.get('homepage') or ''}\n"
+                         f"License: {ver.get('license') or d.get('license') or '-'}\n\n"
+                         f"{(d.get('readme') or '')[:4000]}")
+        if eco == "crates":
+            c = d.get("crate", {})
+            return _clip(f"{c.get('name')} {c.get('max_stable_version') or c.get('max_version')} (crates.io)\n"
+                         f"{c.get('description') or ''}\n"
+                         f"Docs: {c.get('documentation') or ''}\n"
+                         f"Repo: {c.get('repository') or ''}\n"
+                         f"Downloads: {c.get('downloads')}")
+    return "ERROR: package not found — " + "; ".join(errs)
+
+
+def fetch_error(query: str, max_results: int = 5) -> str:
+    """Search Stack Overflow for an error/question via the Stack Exchange API.
+
+    Returns top questions with links, score, answered flag; includes the accepted
+    answer body for the best hit when cheap to do so."""
+    try:
+        r = requests.get(
+            "https://api.stackexchange.com/2.3/search/advanced",
+            params={"order": "desc", "sort": "relevance", "q": query,
+                    "site": "stackoverflow", "pagesize": max_results,
+                    "filter": "withbody"},
+            timeout=30, headers={"User-Agent": "kode/1.0"})
+    except requests.RequestException as e:
+        return f"ERROR: {e}"
+    if r.status_code != 200:
+        return f"ERROR: Stack Exchange returned HTTP {r.status_code}"
+    try:
+        items = r.json().get("items", [])
+    except ValueError:
+        return "ERROR: non-JSON response from Stack Exchange"
+    if not items:
+        return "(no results)"
+    out = []
+    for it in items:
+        ans = "answered" if it.get("is_answered") else "unanswered"
+        out.append(f"[{it.get('score')}] {html.unescape(it.get('title',''))} "
+                   f"({ans})\n   {it.get('link')}")
+    top = items[0]
+    acc = top.get("accepted_answer_id")
+    if acc:
+        try:
+            ar = requests.get(
+                f"https://api.stackexchange.com/2.3/answers/{acc}",
+                params={"site": "stackoverflow", "filter": "withbody"},
+                timeout=30, headers={"User-Agent": "kode/1.0"})
+            a_items = ar.json().get("items", []) if ar.status_code == 200 else []
+            if a_items:
+                body = _strip_html(a_items[0].get("body", "")).strip()
+                out.append(f"\n--- accepted answer for top result ---\n{body[:3000]}")
+        except (requests.RequestException, ValueError):
+            pass
+    return _clip("\n".join(out))
+
+
+def fetch_readme(target: str) -> str:
+    """Fetch a README: 'owner/repo' (GitHub) or a bare package name (PyPI)."""
+    if "/" in target:
+        try:
+            r = requests.get(f"https://api.github.com/repos/{target}/readme",
+                             timeout=30, headers=_gh_headers())
+        except requests.RequestException as e:
+            return f"ERROR: {e}"
+        if r.status_code == 404:
+            return f"ERROR: no README found for {target}"
+        if r.status_code != 200:
+            return f"ERROR: GitHub returned HTTP {r.status_code}"
+        try:
+            d = r.json()
+            import base64
+            body = base64.b64decode(d.get("content", "")).decode("utf-8", "replace")
+        except Exception:  # noqa: BLE001
+            return "ERROR: could not decode README"
+        return _clip(body)
+    # bare name → PyPI description
+    try:
+        r = requests.get(f"https://pypi.org/pypi/{target}/json",
+                         timeout=30, headers={"User-Agent": "kode/1.0"})
+    except requests.RequestException as e:
+        return f"ERROR: {e}"
+    if r.status_code != 200:
+        return f"ERROR: package '{target}' not found on PyPI (HTTP {r.status_code})"
+    try:
+        info = r.json().get("info", {})
+    except ValueError:
+        return "ERROR: non-JSON response from PyPI"
+    desc = info.get("description") or info.get("summary") or ""
+    return _clip(f"{info.get('name')} {info.get('version')}\n\n{desc}") or "(no description)"
+
+
+def _dig(data, keypath: str):
+    """Walk a dotted/indexed key path like 'items[0].name' into JSON data."""
+    cur = data
+    for token in re.findall(r"[^.\[\]]+", keypath):
+        if isinstance(cur, list):
+            cur = cur[int(token)]
+        elif isinstance(cur, dict):
+            cur = cur[token]
+        else:
+            raise KeyError(token)
+    return cur
+
+
+def fetch_json(url: str, keypath: str = "") -> str:
+    """Fetch a URL (safely), parse JSON, optionally filter by a key path
+    like 'items[0].name', and pretty-print the result."""
+    import json as _json
+    r = _safe_get(url)
+    if isinstance(r, str):
+        return r
+    try:
+        data = r.json()
+    except ValueError:
+        return "ERROR: response body is not valid JSON"
+    if keypath:
+        try:
+            data = _dig(data, keypath)
+        except (KeyError, IndexError, ValueError) as e:
+            return f"ERROR: key path '{keypath}' not found ({e})"
+    try:
+        return _clip(_json.dumps(data, indent=2, ensure_ascii=False))
+    except (TypeError, ValueError):
+        return _clip(str(data))
+
+
+def fetch_mdn(query: str, max_results: int = 5) -> str:
+    """Search MDN Web Docs; returns title / url / summary of the top hits."""
+    try:
+        r = requests.get("https://developer.mozilla.org/api/v1/search",
+                         params={"q": query}, timeout=30,
+                         headers={"User-Agent": "kode/1.0"})
+    except requests.RequestException as e:
+        return f"ERROR: {e}"
+    if r.status_code != 200:
+        return f"ERROR: MDN returned HTTP {r.status_code}"
+    try:
+        docs = r.json().get("documents", [])
+    except ValueError:
+        return "ERROR: non-JSON response from MDN"
+    if not docs:
+        return "(no results)"
+    out = []
+    for d in docs[:max_results]:
+        out.append(f"{d.get('title')}\n   https://developer.mozilla.org{d.get('mdn_url')}"
+                   f"\n   {d.get('summary','').strip()}")
+    return _clip("\n".join(out))
+
+
+def fetch_wayback(url: str, timestamp: str = "") -> str:
+    """Fetch the closest Internet Archive snapshot of a URL, stripped to text."""
+    params = {"url": url}
+    if timestamp:
+        params["timestamp"] = timestamp
+    try:
+        r = requests.get("https://archive.org/wayback/available", params=params,
+                         timeout=30, headers={"User-Agent": "kode/1.0"})
+    except requests.RequestException as e:
+        return f"ERROR: {e}"
+    if r.status_code != 200:
+        return f"ERROR: wayback returned HTTP {r.status_code}"
+    try:
+        snap = ((r.json().get("archived_snapshots") or {}).get("closest") or {})
+    except ValueError:
+        return "ERROR: non-JSON response from wayback"
+    snap_url = snap.get("url")
+    if not snap_url or not snap.get("available"):
+        return f"ERROR: no wayback snapshot found for {url}"
+    resp = _safe_get(snap_url)  # arbitrary URL → go through the SSRF guard
+    if isinstance(resp, str):
+        return resp
+    text = resp.text
+    if "html" in resp.headers.get("content-type", ""):
+        text = _strip_html(text)
+    return _clip(f"[snapshot {snap.get('timestamp','')}] {snap_url}\n\n{text.strip()}")
+
+
+def fetch_rfc(number: int, offset: int = 0, limit: int = 0) -> str:
+    """Fetch the plain-text of an IETF RFC by number, optionally line-sliced."""
+    try:
+        n = int(number)
+    except (TypeError, ValueError):
+        return "ERROR: number must be an integer RFC number"
+    try:
+        r = requests.get(f"https://www.rfc-editor.org/rfc/rfc{n}.txt",
+                         timeout=30, headers={"User-Agent": "kode/1.0"})
+    except requests.RequestException as e:
+        return f"ERROR: {e}"
+    if r.status_code == 404:
+        return f"ERROR: RFC {n} not found"
+    if r.status_code != 200:
+        return f"ERROR: rfc-editor returned HTTP {r.status_code}"
+    lines = r.text.splitlines()
+    if offset or limit:
+        end = offset + limit if limit else len(lines)
+        lines = lines[offset:end]
+    return _clip("\n".join(lines))
+
+
+def fetch_manpage(name: str, section: str = "") -> str:
+    """Fetch a man page: local `man` first, else man7.org, stripped to text."""
+    args = ["man", "-P", "cat"]
+    if section:
+        args.append(section)
+    args.append(name)
+    try:
+        r = subprocess.run(args, capture_output=True, text=True, timeout=10)
+        if r.returncode == 0 and r.stdout.strip():
+            # strip backspace-overstrike bolding that some man setups emit
+            out = re.sub(r".\x08", "", r.stdout)
+            return _clip(out.strip())
+    except Exception:  # noqa: BLE001 — man missing/slow: fall through to the web
+        pass
+    sec = section or "1"
+    url = f"https://man7.org/linux/man-pages/man{sec}/{name}.{sec}.html"
+    resp = _safe_get(url)
+    if isinstance(resp, str):
+        return resp
+    if resp.status_code != 200:
+        return f"ERROR: no man page for '{name}' locally or on man7.org"
+    return _clip(_strip_html(resp.text).strip())
+
+
+def fetch_pdf(url: str, pages: str = "") -> str:
+    """Download a PDF (safely) and extract its text. `pages` is an optional
+    range like '1-3' or '2'. Requires the pypdf package."""
+    try:
+        import pypdf  # noqa: F401 — imported lazily so it's not a hard dep
+    except ImportError:
+        return ("ERROR: pypdf is not installed — run `pip install pypdf` to enable "
+                "fetch_pdf.")
+    resp = _safe_get(url, max_bytes=MAX_FETCH_BYTES)
+    if isinstance(resp, str):
+        return resp
+    import io
+    try:
+        reader = pypdf.PdfReader(io.BytesIO(resp.content))
+    except Exception as e:  # noqa: BLE001
+        return f"ERROR: could not parse PDF ({e})"
+    n = len(reader.pages)
+    start, end = 0, n
+    if pages:
+        m = re.match(r"^\s*(\d+)\s*(?:-\s*(\d+))?\s*$", pages)
+        if not m:
+            return "ERROR: pages must look like '2' or '1-3'"
+        start = max(0, int(m.group(1)) - 1)
+        end = int(m.group(2)) if m.group(2) else start + 1
+        end = min(end, n)
+    parts = []
+    for i in range(start, end):
+        try:
+            parts.append(reader.pages[i].extract_text() or "")
+        except Exception:  # noqa: BLE001
+            parts.append("")
+    text = "\n".join(parts).strip()
+    return _clip(f"[{n} pages, showing {start + 1}-{end}]\n\n{text}") or "(no extractable text)"
 
 
 def todo_write(todos: list) -> str:
@@ -533,6 +936,16 @@ TOOL_FUNCS = {
     "grep": grep,
     "fetch_url": fetch_url,
     "web_search": web_search,
+    "fetch_github": fetch_github,
+    "fetch_docs": fetch_docs,
+    "fetch_error": fetch_error,
+    "fetch_readme": fetch_readme,
+    "fetch_json": fetch_json,
+    "fetch_mdn": fetch_mdn,
+    "fetch_wayback": fetch_wayback,
+    "fetch_rfc": fetch_rfc,
+    "fetch_manpage": fetch_manpage,
+    "fetch_pdf": fetch_pdf,
     "todo_write": todo_write,
 }
 
@@ -700,6 +1113,157 @@ TOOLS_SPEC = [
                     "max_results": {"type": "integer", "description": "default 6"},
                 },
                 "required": ["query"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "fetch_github",
+            "description": "Fetch from GitHub for an owner/repo: file contents, issues, PRs, or releases. Use when you need source, an issue/PR thread, or release notes from a specific repo.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "repo": {"type": "string", "description": "'owner/name'"},
+                    "kind": {"type": "string", "enum": ["file", "issues", "prs", "releases"]},
+                    "path": {"type": "string", "description": "in-repo path when kind=file"},
+                    "ref": {"type": "string", "description": "branch/tag/sha for kind=file"},
+                    "number": {"type": "integer", "description": "a specific issue/PR number"},
+                },
+                "required": ["repo"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "fetch_docs",
+            "description": "Fetch package metadata (version, summary, description, links) from PyPI, npm, or crates.io. Use to check a library's current version or what it does. Ecosystem auto-detected if omitted.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "package": {"type": "string"},
+                    "ecosystem": {"type": "string", "enum": ["pypi", "npm", "crates"]},
+                },
+                "required": ["package"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "fetch_error",
+            "description": "Search Stack Overflow for an error message or how-to question; returns top questions (with links, score, answered flag) plus the accepted answer for the best hit. Use when debugging an unfamiliar error.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "query": {"type": "string"},
+                    "max_results": {"type": "integer", "description": "default 5"},
+                },
+                "required": ["query"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "fetch_readme",
+            "description": "Fetch the README for a GitHub 'owner/repo', or the long description for a bare PyPI package name. Use for a quick overview of a project or library.",
+            "parameters": {
+                "type": "object",
+                "properties": {"target": {"type": "string"}},
+                "required": ["target"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "fetch_json",
+            "description": "Fetch a URL, parse it as JSON, optionally drill in with a key path like 'items[0].name', and pretty-print. Use for JSON API endpoints where you want a specific field.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "url": {"type": "string"},
+                    "keypath": {"type": "string", "description": "e.g. 'items[0].name'"},
+                },
+                "required": ["url"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "fetch_mdn",
+            "description": "Search MDN Web Docs for web platform APIs (JS/CSS/HTTP); returns title/url/summary of top hits. Use for authoritative web-standards references.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "query": {"type": "string"},
+                    "max_results": {"type": "integer", "description": "default 5"},
+                },
+                "required": ["query"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "fetch_wayback",
+            "description": "Fetch an archived Internet Archive snapshot of a URL (stripped to text). Use when a page is down, changed, or you need a historical version.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "url": {"type": "string"},
+                    "timestamp": {"type": "string", "description": "optional YYYYMMDD to target"},
+                },
+                "required": ["url"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "fetch_rfc",
+            "description": "Fetch the plain text of an IETF RFC by number, optionally line-sliced. Use for protocol/spec references (HTTP, TLS, etc.).",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "number": {"type": "integer"},
+                    "offset": {"type": "integer", "description": "0-indexed start line"},
+                    "limit": {"type": "integer", "description": "max lines"},
+                },
+                "required": ["number"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "fetch_manpage",
+            "description": "Fetch a Unix man page (local `man` first, else man7.org), as text. Use for CLI flags and system-call details.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "name": {"type": "string"},
+                    "section": {"type": "string", "description": "optional man section, e.g. '2'"},
+                },
+                "required": ["name"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "fetch_pdf",
+            "description": "Download a PDF and extract its text (optional page range like '1-3'). Requires pypdf. Use to read PDF docs/specs/papers.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "url": {"type": "string"},
+                    "pages": {"type": "string", "description": "e.g. '2' or '1-3'"},
+                },
+                "required": ["url"],
             },
         },
     },
