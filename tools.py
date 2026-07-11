@@ -1309,6 +1309,22 @@ TOOLS_SPEC = [
     {
         "type": "function",
         "function": {
+            "name": "spawn_swarm",
+            "description": "Fan a BROAD goal out to a swarm of parallel read-only workers (up to 10). A planner splits the goal into independent angles, each worker investigates one, and a synthesis pass merges everything into one report. Use for wide investigations (audit a codebase, survey a design space, map a large module) where you don't already know the exact sub-questions — if you do, prefer spawn_agents.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "task": {"type": "string", "description": "the overall goal to investigate"},
+                    "n": {"type": "integer", "description": "number of workers, 2-10 (default 6)"},
+                    "model": {"type": "string", "description": "optional model id the workers run on (e.g. a cheap model for breadth)"},
+                },
+                "required": ["task"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
             "name": "switch_model",
             "description": "Switch the model YOU (the main agent) run on for the rest of the task. Use a cheaper/faster model for simple mechanical work, or a stronger 'thinking' model for hard debugging or design. State why. The switch persists until you change it again.",
             "parameters": {

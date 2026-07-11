@@ -271,6 +271,108 @@ def test_bash_allowlist():
     assert not a._bash_allowed("pytestx")  # not a real prefix match
 
 
+# --------------------------------------------------------------------------- #
+# agent: approval modes (confirm / auto / plan / yolo)
+# --------------------------------------------------------------------------- #
+def test_yolo_property_tracks_mode():
+    a = _agent()
+    assert a.mode == "confirm" and not a.yolo
+    a.mode = "yolo"
+    assert a.yolo
+
+
+def test_legacy_yolo_kwarg_maps_to_mode():
+    a = agent.Agent("k", "m/x", yolo=True)
+    assert a.mode == "yolo" and a.yolo
+
+
+def test_set_mode_briefs_model_on_plan_toggle():
+    a = _agent()
+    a.set_mode("plan")
+    assert a._prev_mode == "confirm"
+    assert a.messages[-1]["role"] == "system"
+    assert "plan mode is on" in a.messages[-1]["content"].lower()
+    a.set_mode("confirm")
+    assert "plan mode is off" in a.messages[-1]["content"].lower()
+
+
+def test_auto_mode_approves_edits_not_bash():
+    a = _agent()
+    a.set_mode("auto")
+    assert a._auto_approved("write_file", {})
+    assert a._auto_approved("edit_file", {})
+    assert a._auto_approved("multi_edit", {})
+    assert not a._auto_approved("bash", {"command": "pytest -q"})
+    a.bash_allow = ["pytest"]  # the explicit allowlist still works in auto mode
+    assert a._auto_approved("bash", {"command": "pytest -q"})
+
+
+def test_auto_mode_writes_without_prompt(ws):
+    a = _agent()
+    a.set_mode("auto")
+    tc = {"id": "t1", "function": {"name": "write_file", "arguments":
+          json.dumps({"path": "a.txt", "content": "hi"})}}
+    a._run_tool(tc)  # would hang/raise on console.input if it asked
+    assert (ws / "a.txt").read_text() == "hi"
+
+
+def test_plan_mode_blocks_mutations(ws):
+    a = _agent()
+    a.set_mode("plan")
+    tc = {"id": "t1", "function": {"name": "write_file", "arguments":
+          json.dumps({"path": "x.txt", "content": "nope"})}}
+    a._run_tool(tc)
+    assert not (ws / "x.txt").exists()
+    assert "plan mode" in a.messages[-1]["content"].lower()
+    tc = {"id": "t2", "function": {"name": "bash", "arguments":
+          json.dumps({"command": "touch y.txt"})}}
+    a._run_tool(tc)
+    assert not (ws / "y.txt").exists()
+
+
+def test_plan_mode_allows_reads(ws):
+    a = _agent()
+    (ws / "r.txt").write_text("hello plan")
+    a.set_mode("plan")
+    tc = {"id": "t1", "function": {"name": "read_file", "arguments":
+          json.dumps({"path": "r.txt"})}}
+    a._run_tool(tc)
+    assert "hello plan" in a.messages[-1]["content"]
+
+
+# --------------------------------------------------------------------------- #
+# agent: _complete streams under the hood
+# --------------------------------------------------------------------------- #
+def test_complete_parses_streamed_toolcalls(monkeypatch):
+    a = _agent()
+    sse = [
+        b'data: {"choices":[{"delta":{"reasoning":"hmm "}}]}',
+        b'data: {"choices":[{"delta":{"content":"part"}}]}',
+        b'data: {"choices":[{"delta":{"tool_calls":[{"index":0,"id":"t1",'
+        b'"function":{"name":"read_file","arguments":"{\\"pa"}}]}}]}',
+        b'data: {"choices":[{"delta":{"tool_calls":[{"index":0,'
+        b'"function":{"arguments":"th\\": \\"x\\"}"}}]}}]}',
+        b'data: {"usage":{"prompt_tokens":7,"completion_tokens":3},"choices":[]}',
+        b'data: [DONE]',
+    ]
+
+    class FakeResp:
+        def iter_lines(self):
+            return iter(sse)
+        def close(self):
+            pass
+
+    seen = {}
+    monkeypatch.setattr(a, "_post",
+                        lambda payload, stream: seen.update(payload) or FakeResp())
+    msg = a._complete([{"role": "user", "content": "hi"}], tools_spec=[{"x": 1}])
+    assert seen["stream"] is True  # the hang fix: always streams
+    assert msg["content"] == "part" and msg["reasoning"] == "hmm "
+    assert msg["tool_calls"][0]["function"]["name"] == "read_file"
+    assert json.loads(msg["tool_calls"][0]["function"]["arguments"]) == {"path": "x"}
+    assert a.prompt_tokens == 7 and a.completion_tokens == 3
+
+
 def test_checkpointer_snapshot_and_reset(tmp_path):
     import checkpoint
     home = tmp_path / "home"
@@ -343,11 +445,12 @@ def test_onboarding_saves_choices(tmp_path, monkeypatch):
     monkeypatch.setenv("OPENROUTER_API_KEY", "sk-or-x")  # skip the key step
     menu = [("m/default", "d"), ("m/think", "reasoning"), ("m/cheap", "cheap")]
     monkeypatch.setattr(agent, "available_menu", lambda: menu)
-    answers = iter(["3", "2"])  # model=cheap, mode=yolo
+    answers = iter(["3", "3"])  # model=cheap, mode=yolo
     monkeypatch.setattr(agent.console, "input", lambda *a, **k: next(answers))
     agent.run_onboarding()
     cfg = agent.load_config()
-    assert cfg["model"] == "m/cheap" and cfg["yolo"] is True
+    assert cfg["model"] == "m/cheap" and cfg["mode"] == "yolo"
+    assert "yolo" not in cfg  # legacy boolean replaced by "mode"
     assert cfg["auto_route"] is False
 
 
@@ -375,6 +478,7 @@ def test_onboarding_auto_route_choice(tmp_path, monkeypatch):
     agent.run_onboarding()
     cfg = agent.load_config()
     assert cfg["auto_route"] is True and cfg["model"] == "m/default"
+    assert cfg["mode"] == "confirm"
 
 
 def test_route_model_picks_by_prompt(monkeypatch):
@@ -455,6 +559,68 @@ def test_spawn_many_runs_all(monkeypatch):
     out = a.spawn_many([{"task": "A"}, {"task": "B", "model": "m2"}])
     assert "answer[A|None]" in out and "answer[B|m2]" in out
     assert "sub-agent 1" in out and "sub-agent 2" in out
+
+
+def test_extract_json_list_tolerates_fences_and_objects():
+    assert agent._extract_json_list('```json\n["a", "b"]\n```') == ["a", "b"]
+    assert agent._extract_json_list('[{"task": "x"}, {"task": "y"}]') == ["x", "y"]
+    assert agent._extract_json_list("no json here") == []
+    assert agent._extract_json_list('{"task": "not a list"}') == []
+
+
+def test_swarm_plans_workers_and_synthesizes(monkeypatch):
+    a = _agent()
+    calls = {"planner": 0, "synth": 0}
+
+    def fake_complete(messages, tools_spec=None, model=None):
+        sys = messages[0]["content"]
+        if "split" in sys.lower():
+            calls["planner"] += 1
+            return {"role": "assistant", "content": '["look at A", "look at B"]'}
+        calls["synth"] += 1
+        assert "answer about A" in messages[-1]["content"]  # findings passed in
+        return {"role": "assistant", "content": "merged report"}
+
+    monkeypatch.setattr(a, "_complete", fake_complete)
+    monkeypatch.setattr(a, "spawn",
+                        lambda task, model=None: f"answer about {task[8:9]}")
+    out = a.swarm("audit the thing", n=2)
+    assert calls == {"planner": 1, "synth": 1}
+    assert "2 workers" in out and "merged report" in out
+
+
+def test_swarm_caps_worker_count(monkeypatch):
+    a = _agent()
+    many = json.dumps([f"t{i}" for i in range(30)])
+    monkeypatch.setattr(a, "_complete", lambda m, tools_spec=None, model=None:
+                        {"role": "assistant", "content": many})
+    ran = []
+    monkeypatch.setattr(a, "spawn", lambda task, model=None:
+                        ran.append(task) or "ok")
+    a.swarm("big goal", n=99)
+    assert len(ran) == agent.MAX_SWARM  # both n and the plan are capped
+
+
+def test_swarm_falls_back_to_single_agent_on_planner_junk(monkeypatch):
+    a = _agent()
+    monkeypatch.setattr(a, "_complete", lambda m, tools_spec=None, model=None:
+                        {"role": "assistant", "content": "not json at all"})
+    monkeypatch.setattr(a, "spawn", lambda task, model=None: "single answer")
+    assert a.swarm("goal") == "single answer"
+
+
+def test_swarm_keeps_findings_when_synthesis_fails(monkeypatch):
+    a = _agent()
+
+    def fake_complete(messages, tools_spec=None, model=None):
+        if "split" in messages[0]["content"].lower():
+            return {"role": "assistant", "content": '["q1", "q2"]'}
+        raise RuntimeError("boom")
+
+    monkeypatch.setattr(a, "_complete", fake_complete)
+    monkeypatch.setattr(a, "spawn", lambda task, model=None: "precious finding")
+    out = a.swarm("goal", n=2)
+    assert "precious finding" in out and "synthesis failed" in out
 
 
 def test_spawn_many_caps_parallelism(monkeypatch):

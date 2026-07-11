@@ -4,10 +4,13 @@
 Features
   · streaming responses (reasoning shown dimmed); Ctrl-C stops a reply cleanly
   · diff previews + confirmation before any write / edit / multi_edit / shell command
-  · /undo, per-tool "always allow", or full auto (--yolo) mode
+  · modes: confirm / auto (file edits auto-approved) / plan (read-only planning) /
+    yolo (approve everything) — /mode, /auto, /plan, /yolo, or --mode
+  · /undo and per-tool "always allow"
   · tools: read/write/edit/multi_edit/list/glob/grep/bash(+background)/fetch_url/
-    todo_write/spawn_agent/spawn_agents (parallel read-only sub-agents)/switch_model
-  · autonomy: spawns its own sub-agents and switches its own model when the work warrants
+    todo_write/spawn_agent/spawn_agents (parallel read-only sub-agents)/
+    spawn_swarm (plan → up to 10 parallel workers → merged report)/switch_model
+  · autonomy: spawns its own sub-agents/swarms and switches its own model when the work warrants
   · retry+backoff on transient API errors; auto-compaction near the context limit
   · @file mentions inline file contents; Tab completes commands and paths
   · project docs (KODE.md/AGENTS.md/CLAUDE.md) + live env auto-loaded into context
@@ -15,7 +18,8 @@ Features
 
 Usage
   export OPENROUTER_API_KEY=sk-or-...
-  ./kode [workspace] [--model ID] [--yolo] [--budget USD] [--resume [name]]
+  ./kode [workspace] [--model ID] [--mode confirm|auto|plan|yolo] [--budget USD]
+         [--resume [name]]
 
 Type /help inside for commands.
 """
@@ -51,7 +55,7 @@ from rich.text import Text
 import checkpoint
 import tools
 
-__version__ = "0.3.0"
+__version__ = "0.5.0"
 API_URL = "https://openrouter.ai/api/v1/chat/completions"
 MODELS_URL = "https://openrouter.ai/api/v1/models"
 DEFAULT_MODEL = "moonshotai/kimi-k2.7-code"
@@ -71,16 +75,55 @@ READONLY_TOOLS = {"read_file", "grep", "glob_files", "list_dir", "fetch_url",
                   "fetch_readme", "fetch_json", "fetch_mdn", "fetch_wayback",
                   "fetch_rfc", "fetch_manpage", "fetch_pdf"}
 MAX_PARALLEL_AGENTS = 4
+MAX_SWARM = 10          # hard cap on swarm workers (cost guard)
+SWARM_DEFAULT_N = 6
+FILE_TOOLS = {"write_file", "edit_file", "multi_edit"}  # mutating, but not bash
+
+# Approval modes: how much the user reviews before anything runs.
+MODES = ("confirm", "auto", "plan", "yolo")
+MODE_INFO = {
+    "confirm": ("green",  "review each file write / command"),
+    "auto":    ("yellow", "file edits auto-approved; bash still confirmed"),
+    "plan":    ("cyan",   "read-only: research + propose a plan, no changes"),
+    "yolo":    ("red",    "everything auto-approved"),
+}
+
+PLAN_PROMPT = (
+    "Plan mode is ON. You are in read-only planning mode: investigate with the "
+    "read-only tools, then present a concise numbered implementation plan — the "
+    "files to change, what changes in each, the order of steps, risks, and how "
+    "you'll verify the result. Do NOT call write_file/edit_file/multi_edit/bash; "
+    "they are rejected while planning. Finish by asking the user to approve the plan."
+)
 
 # Curated models the agent is told it can switch to / delegate to. Any that
 # aren't in the live OpenRouter catalog are filtered out before use.
+# Order matters: the first entry is the role default, and _role_models picks the
+# first description matching "reason/think" and "cheap/fast" — keep those three
+# at the top.
 MODEL_MENU = [
-    ("moonshotai/kimi-k2.7-code",  "strong coding default"),
+    ("moonshotai/kimi-k2.7-code",   "strong coding default"),
     ("moonshotai/kimi-k2-thinking", "deep reasoning — hard debugging / design"),
     ("moonshotai/kimi-k2.5",        "cheaper & faster — simple mechanical edits"),
-    ("anthropic/claude-sonnet-5",   "strong general-purpose alternative"),
+    # frontier alternatives
+    ("anthropic/claude-sonnet-5",   "strong general-purpose alternative, 1M ctx"),
+    ("anthropic/claude-opus-4.8",   "top-end frontier — save for the hardest problems (pricey)"),
+    ("anthropic/claude-haiku-4.5",  "small frontier model — quick quality answers"),
     ("openai/gpt-5.1",              "alternative frontier model"),
-    ("google/gemini-2.5-pro",       "long-context alternative"),
+    ("openai/gpt-5.1-codex",        "OpenAI's coding-tuned frontier model"),
+    ("openai/gpt-5-mini",           "budget OpenAI all-rounder"),
+    ("google/gemini-2.5-pro",       "long-context alternative (1M ctx)"),
+    ("google/gemini-2.5-flash",     "speedy long-context workhorse"),
+    ("x-ai/grok-4.3",               "frontier alternative, 1M ctx"),
+    # strong open-weight / budget picks
+    ("deepseek/deepseek-v3.2",      "very low-cost capable generalist"),
+    ("deepseek/deepseek-r1-0528",   "open-weight reasoner — careful step-by-step analysis"),
+    ("qwen/qwen3-coder",            "open-weight coder, 1M ctx, low cost"),
+    ("qwen/qwen3-max",              "large Qwen generalist"),
+    ("z-ai/glm-4.7",                "solid open-weight coding/agent model"),
+    ("minimax/minimax-m2.1",        "low-cost agentic coding model"),
+    ("mistralai/codestral-2508",    "code-completion specialist, very low cost"),
+    ("meta-llama/llama-4-maverick", "dirt-cheap long-context utility model"),
 ]
 
 console = Console()
@@ -97,6 +140,9 @@ Guidelines:
 - Verify your work by running tests or commands via bash when it makes sense. Use bash background=true for long-running processes.
 - Delegate large read-only investigations to spawn_agent to keep your own context small.
   When a task splits into several INDEPENDENT questions, use spawn_agents to run them in parallel.
+  For BROAD goals with many unknown angles (audit a codebase, map a system, survey options),
+  use spawn_swarm: a planner splits the goal, up to 10 workers run in parallel (put them on a
+  cheap model for breadth), and you get back one merged report.
 - Manage your own model. Call switch_model when the work changes character: drop to a cheaper/
   faster model for mechanical edits and boilerplate; move to a 'thinking' model for hard
   debugging, tricky design, or when you're stuck. Always say why in one line.
@@ -174,6 +220,43 @@ def _extract_json(text: str) -> dict:
         return json.loads(m.group(0))
     except json.JSONDecodeError:
         return {}
+
+
+def _extract_json_list(text: str) -> list[str]:
+    """Pull a JSON array of strings out of a model reply (tolerates fences and
+    arrays of {task: ...} objects)."""
+    m = re.search(r"\[.*\]", text, re.S)
+    if not m:
+        return []
+    try:
+        data = json.loads(m.group(0))
+    except json.JSONDecodeError:
+        return []
+    if not isinstance(data, list):
+        return []
+    out = []
+    for x in data:
+        if isinstance(x, str) and x.strip():
+            out.append(x.strip())
+        elif isinstance(x, dict) and str(x.get("task", "")).strip():
+            out.append(str(x["task"]).strip())
+    return out
+
+
+SWARM_PLAN_SYSTEM = (
+    "You split an investigation goal into independent sub-tasks that can run "
+    "in parallel with no shared state. Cover the goal completely with minimal "
+    "overlap; make each sub-task self-contained and concrete (name files/dirs/"
+    "topics explicitly — workers don't see each other's output). Reply with "
+    "ONLY a JSON array of sub-task strings."
+)
+
+SWARM_SYNTH_SYSTEM = (
+    "You merge findings from parallel research workers into one coherent, "
+    "de-duplicated report that answers the original goal. Be concrete, keep "
+    "file paths and evidence, resolve contradictions explicitly, and note "
+    "anything no worker covered."
+)
 
 
 _FOLLOWUP_RE = re.compile(
@@ -407,10 +490,11 @@ def project_context(workspace: Path) -> str | None:
 class Agent:
     def __init__(self, api_key: str, model: str, yolo: bool = False,
                  system: str | None = None, budget: float | None = None,
-                 auto_route: bool = False):
+                 auto_route: bool = False, mode: str | None = None):
         self.api_key = api_key
         self.model = model
-        self.yolo = yolo
+        self.mode = "confirm"
+        self._prev_mode = "confirm"  # what plan mode returns to on exit
         self.budget = budget
         self.auto_route = auto_route
         self.router_model = default_router_model()
@@ -433,6 +517,27 @@ class Agent:
         self.last_input: str | None = None  # for /retry
         self.title: str | None = None       # auto-named from first prompt
         self.bash_allow: list[str] = []      # command prefixes auto-approved
+        want = mode or ("yolo" if yolo else "confirm")
+        if want in MODES and want != "confirm":
+            self.set_mode(want)
+
+    # ---- approval modes --------------------------------------------------- #
+    @property
+    def yolo(self) -> bool:
+        return self.mode == "yolo"
+
+    def set_mode(self, new: str) -> None:
+        """Switch approval mode; entering/leaving plan mode briefs the model."""
+        old = self.mode
+        if new == old:
+            return
+        if new == "plan":
+            self._prev_mode = old
+            self.messages.append({"role": "system", "content": PLAN_PROMPT})
+        elif old == "plan":
+            self.messages.append({"role": "system", "content":
+                                  "Plan mode is OFF. All tools are available again."})
+        self.mode = new
 
     # ---- pricing / cost --------------------------------------------------- #
     def _price(self) -> tuple[float, float]:
@@ -551,16 +656,66 @@ class Agent:
         return self._ctx_limit
 
     def _complete(self, messages: list, tools_spec=None, model: str | None = None) -> dict:
+        """Non-interactive completion (sub-agents, router, compaction).
+
+        Streams under the hood: OpenRouter's non-streaming endpoint can stall
+        for minutes on some providers (keep-alive bytes defeat the read
+        timeout) while the identical request streamed finishes in seconds."""
         m = model or self.model
         payload = {"model": m, "messages": apply_cache_control(messages, m),
-                   "temperature": self.temperature}
+                   "temperature": self.temperature, "stream": True,
+                   "stream_options": {"include_usage": True}}
         if tools_spec:
             payload["tools"] = tools_spec
             payload["tool_choice"] = "auto"
-        resp = self._post(payload, stream=False)
-        data = resp.json()
-        self._account(data.get("usage"))
-        return data["choices"][0]["message"]
+        resp = self._post(payload, stream=True)
+        content, reasoning = "", ""
+        tc_acc: dict[int, dict] = {}
+        try:
+            for raw in resp.iter_lines():
+                if not raw:
+                    continue
+                line = raw.decode("utf-8", "replace")
+                if not line.startswith("data: "):
+                    continue
+                data = line[6:]
+                if data == "[DONE]":
+                    break
+                try:
+                    chunk = json.loads(data)
+                except json.JSONDecodeError:
+                    continue
+                self._account(chunk.get("usage"))
+                choices = chunk.get("choices") or []
+                if not choices:
+                    continue
+                delta = choices[0].get("delta") or {}
+                if delta.get("reasoning"):
+                    reasoning += delta["reasoning"]
+                if delta.get("content"):
+                    content += delta["content"]
+                for tc in delta.get("tool_calls") or []:
+                    idx = tc.get("index", 0)
+                    slot = tc_acc.setdefault(idx, {"id": "", "name": "", "args": ""})
+                    if tc.get("id"):
+                        slot["id"] = tc["id"]
+                    fn = tc.get("function") or {}
+                    if fn.get("name"):
+                        slot["name"] = fn["name"]
+                    if fn.get("arguments"):
+                        slot["args"] += fn["arguments"]
+        finally:
+            resp.close()
+        msg: dict = {"role": "assistant", "content": content or None}
+        if reasoning:
+            msg["reasoning"] = reasoning
+        if tc_acc:
+            msg["tool_calls"] = [
+                {"id": s["id"] or f"call_{i}", "type": "function",
+                 "function": {"name": s["name"], "arguments": s["args"] or "{}"}}
+                for i, s in sorted(tc_acc.items())
+            ]
+        return msg
 
     # ---- streaming model call -------------------------------------------- #
     def _stream(self) -> dict:
@@ -908,6 +1063,65 @@ class Agent:
             for i, t in enumerate(tasks)
         )
 
+    # ---- swarms ------------------------------------------------------------ #
+    def plan_swarm(self, task: str, n: int) -> list[str]:
+        """Split `task` into up to `n` independent sub-tasks (cheap planner call)."""
+        ask = [
+            {"role": "system", "content": SWARM_PLAN_SYSTEM},
+            {"role": "user", "content":
+             f"Split this goal into at most {n} parallel sub-tasks:\n\n{task}"},
+        ]
+        try:
+            m = self._complete(ask, model=self.router_model)
+            return _extract_json_list(
+                (m.get("content") or m.get("reasoning") or ""))[:n]
+        except Exception:  # noqa: BLE001
+            return []
+
+    def swarm(self, task: str, n: int | None = None,
+              model: str | None = None) -> str:
+        """Plan → fan out parallel read-only workers → synthesize one report."""
+        if not task.strip():
+            return "ERROR: no task given"
+        n = max(2, min(int(n or SWARM_DEFAULT_N), MAX_SWARM))
+        subtasks = self.plan_swarm(task, n)
+        if not subtasks:  # planner failed/returned junk — degrade to one agent
+            console.print("[yellow]swarm planner failed — "
+                          "falling back to a single sub-agent[/yellow]")
+            return self.spawn(task, model=model)
+        for i, s in enumerate(subtasks, 1):
+            console.print(f"  [dim]swarm {i}/{len(subtasks)}: {s[:90]}[/dim]")
+
+        results: list[str | None] = [None] * len(subtasks)
+
+        def work(i: int, sub: str) -> None:
+            results[i] = self.spawn(
+                f"{sub}\n\n(Part of a wider goal: {task[:300]} — answer ONLY "
+                f"your sub-task, concisely.)", model=model)
+
+        with concurrent.futures.ThreadPoolExecutor(
+                max_workers=len(subtasks)) as ex:
+            concurrent.futures.wait(
+                [ex.submit(work, i, s) for i, s in enumerate(subtasks)])
+
+        findings = "\n\n".join(
+            f"### worker {i + 1}: {s[:80]}\n{results[i]}"
+            for i, s in enumerate(subtasks))
+        synth = [
+            {"role": "system", "content": SWARM_SYNTH_SYSTEM},
+            {"role": "user", "content":
+             f"Original goal:\n{task}\n\nWorker findings:\n\n{findings}"},
+        ]
+        try:
+            m = self._complete(synth)
+            merged = (m.get("content") or m.get("reasoning") or "").strip()
+        except Exception as e:  # noqa: BLE001
+            merged = f"(synthesis failed: {e})\n\nRaw worker findings:\n\n{findings}"
+        if not merged:
+            merged = "Raw worker findings (synthesis was empty):\n\n" + findings
+        return (f"Swarm report ({len(subtasks)} workers"
+                + (f" on {model}" if model else "") + f"):\n\n{merged}")
+
     # ---- dedicated model-router agent ------------------------------------ #
     def route_via_agent(self, prompt: str) -> tuple[str, str]:
         """Ask a small dedicated router agent which model should handle `prompt`.
@@ -964,10 +1178,16 @@ class Agent:
         return any(cmd == p or cmd.startswith(p + " ")
                    for p in self.bash_allow if p)
 
+    def _auto_approved(self, tool: str, args: dict) -> bool:
+        """Whether a mutating tool call runs without asking, given the mode."""
+        if self.mode == "yolo" or tool in self.approved:
+            return True
+        if tool == "bash":
+            return self._bash_allowed(args.get("command", ""))
+        return self.mode == "auto" and tool in FILE_TOOLS
+
     # ---- confirmation + diff --------------------------------------------- #
     def _confirm(self, tool: str, preview) -> tuple[bool, str]:
-        if self.yolo or tool in self.approved:
-            return True, ""
         console.print(preview)
         ans = console.input(
             "[bold]approve?[/bold] [green]y[/green]/[cyan]a[/cyan]lways/"
@@ -992,8 +1212,15 @@ class Agent:
 
         _render_tool_call(name, args)
 
-        auto_ok = (name == "bash" and self._bash_allowed(args.get("command", "")))
-        if name in tools.MUTATING and not auto_ok:
+        if name in tools.MUTATING and self.mode == "plan":
+            console.print("[cyan]↳ blocked (plan mode — read-only)[/cyan]")
+            self.messages.append(
+                {"role": "tool", "tool_call_id": tc["id"],
+                 "content": "Rejected: plan mode is read-only. Fold this step "
+                            "into the plan instead of executing it."})
+            return
+
+        if name in tools.MUTATING and not self._auto_approved(name, args):
             ok, feedback = self._confirm(name, _preview_for(name, args))
             if not ok:
                 result = ("User declined this action. Do not attempt it again "
@@ -1005,7 +1232,7 @@ class Agent:
                 return
 
         # Tools handled by the agent itself (need self), not the tools module.
-        if name in ("spawn_agent", "spawn_agents", "switch_model"):
+        if name in ("spawn_agent", "spawn_agents", "spawn_swarm", "switch_model"):
             try:
                 if name == "spawn_agent":
                     with console.status("[dim]sub-agent working…[/dim]", spinner="dots"):
@@ -1015,6 +1242,10 @@ class Agent:
                     with console.status(f"[dim]{len(tsk)} sub-agents working in "
                                         f"parallel…[/dim]", spinner="dots"):
                         result = self.spawn_many(tsk)
+                elif name == "spawn_swarm":
+                    with console.status("[dim]swarm working…[/dim]", spinner="dots"):
+                        result = self.swarm(args.get("task", ""),
+                                            args.get("n"), args.get("model"))
                 else:  # switch_model
                     result = self.switch_model(args.get("model", ""),
                                                args.get("reason", ""))
@@ -1084,6 +1315,10 @@ def _render_tool_call(name: str, args: dict) -> None:
     elif name == "spawn_agents":
         detail = f"{len(args.get('tasks', []))} parallel: " + " | ".join(
             t.get("task", "")[:30] for t in args.get("tasks", [])[:4])
+    elif name == "spawn_swarm":
+        detail = (f"{args.get('n', SWARM_DEFAULT_N)} workers"
+                  + (f" [{args['model']}]" if args.get("model") else "")
+                  + ": " + args.get("task", "")[:70])
     elif name == "switch_model":
         detail = f"→ {args.get('model','')}  ({args.get('reason','')[:50]})"
     elif name == "todo_write":
@@ -1097,6 +1332,7 @@ def _render_tool_call(name: str, args: dict) -> None:
 # Tools whose output is worth previewing a few lines of; others get a 1-line summary.
 _CONTENT_TOOLS = {"read_file", "grep", "glob_files", "list_dir", "bash",
                   "fetch_url", "web_search", "spawn_agent", "spawn_agents",
+                  "spawn_swarm",
                   "fetch_github", "fetch_docs", "fetch_error", "fetch_readme",
                   "fetch_json", "fetch_mdn", "fetch_wayback", "fetch_rfc",
                   "fetch_manpage", "fetch_pdf"}
@@ -1494,6 +1730,53 @@ def cmd_allow(agent: Agent, arg: str) -> None:
     console.print(f"[dim]auto-approving bash commands starting with '{prefix}'[/dim]")
 
 
+def _apply_mode(agent: Agent, new: str, cfg: dict) -> None:
+    """Switch mode, persist it (plan is transient), and announce it."""
+    agent.set_mode(new)
+    if new != "plan":  # never save plan as the default — sessions would start read-only
+        cfg["mode"] = new
+        cfg.pop("yolo", None)
+        save_config(cfg)
+    color, desc = MODE_INFO[new]
+    console.print(f"[{color}]● {new}[/{color}] [dim]— {desc}[/dim]")
+
+
+def cmd_mode(agent: Agent, arg: str, cfg: dict) -> None:
+    """Show the mode menu or switch to the named mode."""
+    arg = arg.strip().lower()
+    if not arg:
+        for m in MODES:
+            color, desc = MODE_INFO[m]
+            cur = "  [bold]← current[/bold]" if m == agent.mode else ""
+            console.print(f"  [{color}]●[/{color}] {m:<8} [dim]{desc}[/dim]{cur}")
+        console.print("[dim]usage: /mode confirm|auto|plan|yolo[/dim]")
+        return
+    if arg not in MODES:
+        console.print(f"[yellow]unknown mode '{arg}' — one of: "
+                      f"{', '.join(MODES)}[/yellow]")
+        return
+    _apply_mode(agent, arg, cfg)
+
+
+def _offer_plan_execution(agent: Agent, cfg: dict) -> None:
+    """After a plan-mode turn, offer to approve the plan and execute it."""
+    try:
+        ans = console.input(
+            "[bold]plan:[/bold] [green]e[/green]xecute / "
+            "e[yellow]x[/yellow]ecute in auto mode / "
+            "[dim]Enter = keep planning[/dim] › ").strip().lower()
+    except (EOFError, KeyboardInterrupt):
+        return
+    if ans in ("e", "execute", "y", "yes"):
+        new = agent._prev_mode if agent._prev_mode != "plan" else "confirm"
+    elif ans in ("x", "a", "auto"):
+        new = "auto"
+    else:
+        return
+    _apply_mode(agent, new, cfg)
+    _run_user_turn(agent, "The plan is approved — execute it now.")
+
+
 def run_onboarding() -> None:
     """First-run setup wizard: key → default model → confirmation mode."""
     console.print(Panel.fit(
@@ -1544,16 +1827,20 @@ def run_onboarding() -> None:
         idx = int(pick) - 1 if pick.isdigit() and 1 <= int(pick) <= len(menu) else 0
         cfg["model"] = menu[idx][0]
 
-    # 3 — confirmation mode
+    # 3 — approval mode
     console.print("\n[bold cyan]3/3[/bold cyan]  [bold]How should kode apply changes?[/bold]")
     console.print("  [cyan]1[/cyan]  confirm  [dim]— review each file write / command "
                   "(recommended)[/dim]")
-    console.print("  [cyan]2[/cyan]  yolo     [dim]— auto-approve everything[/dim]")
-    cfg["yolo"] = console.input("  choose [1-2, default 1] › ").strip() == "2"
+    console.print("  [cyan]2[/cyan]  auto     [dim]— file edits auto-approved; bash "
+                  "still confirmed[/dim]")
+    console.print("  [cyan]3[/cyan]  yolo     [dim]— auto-approve everything[/dim]")
+    pick = console.input("  choose [1-3, default 1] › ").strip()
+    cfg["mode"] = {"2": "auto", "3": "yolo"}.get(pick, "confirm")
+    cfg.pop("yolo", None)  # legacy boolean superseded by "mode"
 
     save_config(cfg)
     console.print("\n[green]✓ all set.[/green]  [dim]change anything anytime: "
-                  "/key · /model · /route · /auto[/dim]")
+                  "/key · /model · /route · /mode[/dim]")
 
 
 def cmd_key(agent: Agent, arg: str) -> None:
@@ -1617,7 +1904,10 @@ HELP = """[bold cyan]kode commands[/bold cyan]
   [green]/model[/green] [id|filter]  switch model (blank/filter = browse catalog)
   [green]/route[/green]             toggle router agent (a cheap model picks per prompt)
   [green]/tools[/green]             list tools the model can call
-  [green]/auto[/green]              toggle YOLO mode (skip all confirmations)
+  [green]/mode[/green] [name]       show / set approval mode: confirm · auto · plan · yolo
+  [green]/auto[/green]              toggle auto mode (file edits auto-approved)
+  [green]/plan[/green]              toggle plan mode (read-only: research + propose a plan)
+  [green]/yolo[/green]              toggle YOLO mode (skip all confirmations)
   [green]/undo[/green]              revert the last file write/edit
   [green]/diff[/green]              show all file changes this session
   [green]/rewind[/green] [n]        undo last n turns: restore files + conversation
@@ -1626,7 +1916,7 @@ HELP = """[bold cyan]kode commands[/bold cyan]
   [green]/jobs[/green] [kill <pid>] list / kill background bash jobs
   [green]/allow[/green] <prefix>    auto-approve bash commands starting with prefix
   [green]/usage[/green]             cost per day / per model across sessions
-  [green]/plan[/green]              re-show the current task plan
+  [green]/todos[/green]             re-show the current task todo list
   [green]/compact[/green]           summarize history to reclaim context
   [green]/temp[/green] <0-2>        set sampling temperature
   [green]/cost[/green]              tokens + $ + context size
@@ -1658,7 +1948,10 @@ CMD_META = {
     "/models": "browse the model catalog",
     "/route": "toggle auto model routing",
     "/tools": "list callable tools",
-    "/auto": "toggle YOLO (skip confirmations)",
+    "/mode": "show / set approval mode",
+    "/auto": "toggle auto mode (auto-approve edits)",
+    "/plan": "toggle plan mode (read-only)",
+    "/yolo": "toggle YOLO (skip confirmations)",
     "/undo": "revert the last file change",
     "/diff": "show this session's file changes",
     "/rewind": "undo last n turns (files + chat)",
@@ -1667,7 +1960,7 @@ CMD_META = {
     "/jobs": "list / kill background jobs",
     "/allow": "auto-approve a bash prefix",
     "/usage": "cost per day / per model",
-    "/plan": "show the task plan",
+    "/todos": "show the task todo list",
     "/cost": "tokens + $ this session",
     "/compact": "summarize history to save context",
     "/temp": "set sampling temperature",
@@ -1762,6 +2055,12 @@ def main() -> None:
     # omitted one; precedence is resolved below (CLI > project > global > default).
     parser.add_argument("workspace", nargs="?", default=os.getcwd())
     parser.add_argument("--model", default=None)
+    parser.add_argument("--mode", choices=MODES, default=None,
+                        help="approval mode: confirm / auto / plan / yolo")
+    parser.add_argument("--auto", dest="auto_mode", action="store_true",
+                        help="shortcut for --mode auto (file edits auto-approved)")
+    parser.add_argument("--plan", dest="plan_mode", action="store_true",
+                        help="shortcut for --mode plan (read-only planning)")
     parser.add_argument("--yolo", action=argparse.BooleanOptionalAction, default=None,
                         help="auto-approve all writes/commands (--no-yolo forces off)")
     parser.add_argument("--budget", type=float, default=None,
@@ -1816,11 +2115,26 @@ def main() -> None:
         return cfg.get(key, default)
 
     model = resolve(args.model, "model", DEFAULT_MODEL)
-    yolo = resolve(args.yolo, "yolo", False)
     budget = resolve(args.budget, "budget", None)
     auto_route = resolve(args.route, "auto_route", False)
 
-    agent = Agent(api_key, model, yolo=yolo, budget=budget,
+    mode_cli = args.mode
+    if mode_cli is None:
+        if args.yolo:
+            mode_cli = "yolo"
+        elif args.plan_mode:
+            mode_cli = "plan"
+        elif args.auto_mode:
+            mode_cli = "auto"
+        elif args.yolo is False:  # explicit --no-yolo
+            mode_cli = "confirm"
+    mode = resolve(mode_cli, "mode", None)
+    if mode is None:  # legacy configs stored a "yolo" boolean instead of "mode"
+        mode = "yolo" if resolve(None, "yolo", False) else "confirm"
+    if mode not in MODES:
+        mode = "confirm"
+
+    agent = Agent(api_key, model, mode=mode, budget=budget,
                   auto_route=auto_route,
                   system=build_system_prompt(tools.WORKSPACE))
     agent.bash_allow = list(pcfg.get("bash_allow", []))
@@ -1884,7 +2198,8 @@ def main() -> None:
             console.print(f"[yellow]no session to resume "
                           f"({args.resume}); starting fresh[/yellow]")
 
-    mode = "[red]● yolo[/red]" if agent.yolo else "[green]● confirm[/green]"
+    mcolor = MODE_INFO[agent.mode][0]
+    mode = f"[{mcolor}]● {agent.mode}[/{mcolor}]"
     model_label = ("auto-route" if agent.auto_route else
                    agent.model.split("/")[-1])
     ck_on = agent.checkpointer and agent.checkpointer.enabled
@@ -1953,10 +2268,16 @@ def main() -> None:
                 console.print("[dim]cleared[/dim]")
             elif cmd in ("model", "models"):
                 cmd_model(agent, session, rest)
-            elif cmd == "auto":
-                agent.yolo = not agent.yolo
-                cfg["yolo"] = agent.yolo; save_config(cfg)
-                console.print(f"[dim]YOLO mode {'ON' if agent.yolo else 'OFF'}[/dim]")
+            elif cmd == "mode":
+                cmd_mode(agent, rest, cfg)
+            elif cmd in ("auto", "plan", "yolo"):
+                # Toggle: /plan off returns to the pre-plan mode, others to confirm.
+                if agent.mode == cmd:
+                    target = agent._prev_mode if cmd == "plan" else "confirm"
+                    target = target if target != "plan" else "confirm"
+                else:
+                    target = cmd
+                _apply_mode(agent, target, cfg)
             elif cmd == "route":
                 agent.auto_route = not agent.auto_route
                 cfg["auto_route"] = agent.auto_route; save_config(cfg)
@@ -1986,7 +2307,8 @@ def main() -> None:
                 agent.api_key = load_api_key() or agent.api_key
                 if ncfg.get("model"):
                     _set_model(agent, ncfg["model"])
-                agent.yolo = ncfg.get("yolo", agent.yolo)
+                if ncfg.get("mode") in MODES:
+                    agent.set_mode(ncfg["mode"])
                 agent.auto_route = ncfg.get("auto_route", agent.auto_route)
             elif cmd == "retry":
                 if not agent.last_input:
@@ -1999,7 +2321,7 @@ def main() -> None:
                 console.print(f"[dim]retrying: {retry_input[:60]}[/dim]")
                 _run_user_turn(agent, retry_input)
                 continue
-            elif cmd == "plan":
+            elif cmd == "todos":
                 _render_todos()
             elif cmd == "tools":
                 tbl = Table(show_header=False, box=None, padding=(0, 2))
@@ -2059,6 +2381,8 @@ def main() -> None:
         _run_user_turn(agent, user)
         if reader:
             stop.set(); reader.join(timeout=0.5)
+        if agent.mode == "plan":
+            _offer_plan_execution(agent, cfg)
         for q in queued:
             if q.startswith("/"):
                 console.print(f"[dim]skipped queued command {q} — run it after[/dim]")
