@@ -60,7 +60,7 @@ from rich.text import Text
 import checkpoint
 import tools
 
-__version__ = "0.7.0"
+__version__ = "0.7.1"
 API_URL = "https://openrouter.ai/api/v1/chat/completions"
 MODELS_URL = "https://openrouter.ai/api/v1/models"
 DEFAULT_MODEL = "moonshotai/kimi-k2.7-code"
@@ -574,6 +574,7 @@ class Agent:
         self.last_input: str | None = None  # for /retry
         self.title: str | None = None       # auto-named from first prompt
         self.bash_allow: list[str] = []      # command prefixes auto-approved
+        self._swarms_this_turn = 0           # one swarm per turn (cost guard)
         want = mode or ("yolo" if yolo else "confirm")
         if want in MODES and want != "confirm":
             self.set_mode(want)
@@ -1041,6 +1042,7 @@ class Agent:
     def run_turn(self, user_input: str,
                  images: list[str] | None = None) -> None:
         self.interrupted = False
+        self._swarms_this_turn = 0
         first_turn = not any(m["role"] == "user" for m in self.messages)
         if self.auto_route and not looks_like_followup(user_input, first_turn):
             with console.status("[dim]router choosing a model…[/dim]", spinner="dots"):
@@ -1376,9 +1378,19 @@ class Agent:
                                         f"parallel…[/dim]", spinner="dots"):
                         result = self.spawn_many(tsk)
                 elif name == "spawn_swarm":
-                    with console.status("[dim]swarm working…[/dim]", spinner="dots"):
-                        result = self.swarm(args.get("task", ""),
-                                            args.get("n"), args.get("model"))
+                    # One swarm per turn: without this, a thorough model loops
+                    # "audit more" indefinitely (observed live: 3 swarms, 12
+                    # workers, never delivered its answer).
+                    if self._swarms_this_turn >= 1:
+                        result = ("ERROR: a swarm already ran this turn. "
+                                  "Synthesize the findings you have and answer "
+                                  "now; only re-swarm if the user asks for it.")
+                    else:
+                        self._swarms_this_turn += 1
+                        with console.status("[dim]swarm working…[/dim]",
+                                            spinner="dots"):
+                            result = self.swarm(args.get("task", ""),
+                                                args.get("n"), args.get("model"))
                 else:  # switch_model
                     result = self.switch_model(args.get("model", ""),
                                                args.get("reason", ""))

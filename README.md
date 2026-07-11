@@ -98,7 +98,8 @@ The agent manages its own compute. Given the right task it will, on its own:
   each worker has a 5-minute wall-clock budget, per-worker findings are
   clipped before synthesis so a chatty swarm can't blow the context window,
   and planning or synthesis failures degrade gracefully
-  (single sub-agent / raw findings). Use it for codebase audits, system
+  (single sub-agent / raw findings). One swarm per turn — the model must
+  synthesize what it has instead of endlessly re-auditing. Use it for codebase audits, system
   mapping, or surveying a design space; `spawn_agents` is better when you
   already know the exact 2–4 questions.
 - **Switch its own model** — `switch_model` drops to a cheaper model for

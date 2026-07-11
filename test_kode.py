@@ -1173,3 +1173,22 @@ def test_bash_preserves_leading_whitespace(ws):
     out = tools.bash(command="printf '   3  x\\n   2  y\\n'")
     assert out.splitlines()[0] == "   3  x"
     assert out.splitlines()[1] == "   2  y"
+
+
+def test_one_swarm_per_turn(monkeypatch):
+    a = _agent()
+    monkeypatch.setattr(agent.Agent, "swarm",
+                        lambda self, task, n=None, model=None: "swarm report")
+    tc = {"id": "s1", "function": {"name": "spawn_swarm",
+                                   "arguments": json.dumps({"task": "audit"})}}
+    a._run_tool(tc)
+    assert a.messages[-1]["content"] == "swarm report"
+    tc["id"] = "s2"
+    a._run_tool(tc)
+    assert "already ran this turn" in a.messages[-1]["content"]
+    # next turn resets the counter
+    monkeypatch.setattr(agent.Agent, "_stream",
+                        lambda self: {"role": "assistant", "content": "ok"})
+    a.checkpointer = None
+    a.run_turn("next")
+    assert a._swarms_this_turn == 0
