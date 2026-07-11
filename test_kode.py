@@ -1165,3 +1165,11 @@ def test_msg_text_handles_parts_and_strings():
     assert agent._msg_text(None) == ""
     assert agent._msg_text([{"type": "text", "text": "a"},
                             {"type": "image_url", "image_url": {"url": "u"}}]) == "a "
+
+
+def test_bash_preserves_leading_whitespace(ws):
+    # A full strip() used to eat the first line's indentation, making aligned
+    # output (e.g. right-justified counts) look inconsistent to the model.
+    out = tools.bash(command="printf '   3  x\\n   2  y\\n'")
+    assert out.splitlines()[0] == "   3  x"
+    assert out.splitlines()[1] == "   2  y"

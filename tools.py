@@ -299,7 +299,9 @@ def _run_foreground(command: str, timeout: int) -> str:
     finally:
         proc.wait()
         timer.cancel()
-    out = "".join(chunks).strip()
+    # Strip blank lines only — a full strip() would eat the first line's
+    # leading whitespace and make aligned output look inconsistent to the model.
+    out = "".join(chunks).strip("\n")
     if timed_out.is_set():
         return _clip(out) + f"\nERROR: command timed out after {timeout}s"
     rc = proc.returncode
