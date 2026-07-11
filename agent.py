@@ -709,10 +709,19 @@ class Agent:
             else:
                 if resp.status_code == 200:
                     return resp
+                # Read the error body defensively (reading it can itself raise
+                # on a broken connection) and close, so retries and hard-error
+                # raises don't leak the socket.
+                try:
+                    body = resp.text[:500]
+                except requests.RequestException:
+                    body = "(unreadable error body)"
+                finally:
+                    resp.close()
                 if resp.status_code in (408, 409, 429, 500, 502, 503, 504):
-                    last_err = f"{resp.status_code}: {resp.text[:200]}"
+                    last_err = f"{resp.status_code}: {body[:200]}"
                 else:
-                    raise RuntimeError(f"OpenRouter {resp.status_code}: {resp.text[:500]}")
+                    raise RuntimeError(f"OpenRouter {resp.status_code}: {body}")
             wait = min(2 ** attempt, 20) + random.uniform(0, 0.5)
             console.print(f"[dim]retry {attempt + 1}/{attempts} in {wait:.1f}s "
                           f"({last_err[:80]})[/dim]")
@@ -930,13 +939,20 @@ class Agent:
         i, msgs = 0, self.messages
         while i < len(msgs):
             m = msgs[i]
+            if m.get("role") == "tool":
+                # Orphaned result — no assistant tool_call owns it. Keeping it
+                # would 400 the next request just like an orphaned call.
+                i += 1
+                continue
             out.append(m)
             if m.get("role") == "assistant" and m.get("tool_calls"):
                 ids = [tc["id"] for tc in m["tool_calls"]]
                 j, seen = i + 1, set()
                 while j < len(msgs) and msgs[j].get("role") == "tool":
-                    seen.add(msgs[j].get("tool_call_id"))
-                    out.append(msgs[j])
+                    tid = msgs[j].get("tool_call_id")
+                    if tid in ids and tid not in seen:  # drop unknown/dupe ids
+                        seen.add(tid)
+                        out.append(msgs[j])
                     j += 1
                 for tid in ids:
                     if tid not in seen:

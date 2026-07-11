@@ -1192,3 +1192,59 @@ def test_one_swarm_per_turn(monkeypatch):
     a.checkpointer = None
     a.run_turn("next")
     assert a._swarms_this_turn == 0
+
+
+# --------------------------------------------------------------------------- #
+# swarm-audit fixes: response cleanup + orphaned tool results
+# --------------------------------------------------------------------------- #
+class _FakeErrResp:
+    text = "err body"
+
+    def __init__(self, status):
+        self.status_code = status
+        self.closed = False
+
+    def close(self):
+        self.closed = True
+
+
+def test_post_retry_closes_responses_on_retryable_errors(monkeypatch):
+    a = _agent()
+    made = []
+
+    def fake_post(*args, **kwargs):
+        r = _FakeErrResp(503)
+        made.append(r)
+        return r
+
+    monkeypatch.setattr(agent.requests, "post", fake_post)
+    monkeypatch.setattr(agent.time, "sleep", lambda s: None)
+    with pytest.raises(agent._ProviderDown):
+        a._post_retry({"model": "m/x"}, stream=True, attempts=2)
+    assert len(made) == 2 and all(r.closed for r in made)
+
+
+def test_post_retry_closes_response_on_hard_error(monkeypatch):
+    a = _agent()
+    r = _FakeErrResp(401)
+    monkeypatch.setattr(agent.requests, "post", lambda *a_, **k: r)
+    with pytest.raises(RuntimeError, match="401"):
+        a._post_retry({"model": "m/x"}, stream=True, attempts=3)
+    assert r.closed
+
+
+def test_repair_drops_orphan_and_unknown_tool_results():
+    a = _agent()
+    a.messages += [
+        {"role": "tool", "tool_call_id": "ghost", "content": "orphan"},
+        {"role": "assistant", "content": None,
+         "tool_calls": [{"id": "t1", "type": "function",
+                         "function": {"name": "read_file", "arguments": "{}"}}]},
+        {"role": "tool", "tool_call_id": "wrong-id", "content": "mismatched"},
+        {"role": "user", "content": "next"},
+    ]
+    a.repair_history()
+    tool_msgs = [m for m in a.messages if m.get("role") == "tool"]
+    # orphan + unknown-id results dropped; t1 got a stub instead
+    assert [m["tool_call_id"] for m in tool_msgs] == ["t1"]
+    assert "interrupted" in tool_msgs[0]["content"]
