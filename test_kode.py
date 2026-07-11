@@ -4,6 +4,7 @@ Covers the tricky, easy-to-break logic: path sandboxing, atomic edits, the
 secret/stale/dangerous guards, history repair, context pruning, compaction,
 and @mention parsing. No network required (the API is stubbed).
 """
+import base64
 import json
 import time
 from pathlib import Path
@@ -229,9 +230,30 @@ def test_compact_keeps_last_user_turn():
 # --------------------------------------------------------------------------- #
 def test_expand_mentions_ignores_emails(ws):
     (ws / "note.txt").write_text("HELLO")
-    out = agent.expand_mentions("email me@host.com and see @note.txt")
+    out, images = agent.expand_mentions("email me@host.com and see @note.txt")
     assert "HELLO" in out
     assert "host.com" not in out.split("note.txt")[-1]  # host.com not inlined
+    assert images == []
+
+
+def test_expand_mentions_attaches_images(ws):
+    # 1x1 PNG
+    png = base64.b64decode(
+        "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR4nGNgYGBg"
+        "AAAABQABh6FO1AAAAABJRU5ErkJggg==")
+    (ws / "shot.png").write_bytes(png)
+    out, images = agent.expand_mentions("why is @shot.png rendering wrong?")
+    assert len(images) == 1
+    assert images[0].startswith("data:image/png;base64,")
+    assert "shot.png" in out  # text untouched, no inline block for images
+
+
+def test_expand_mentions_skips_huge_images(ws, monkeypatch):
+    monkeypatch.setattr(agent, "MAX_IMAGE_BYTES", 10)
+    (ws / "big.png").write_bytes(b"x" * 100)
+    out, images = agent.expand_mentions("see @big.png")
+    assert images == []
+    assert "skipped" in out
 
 
 def test_default_temperature():
@@ -1010,3 +1032,136 @@ def test_fetch_pdf_network_error(monkeypatch):
     monkeypatch.setattr(builtins, "__import__", fake_import)
     monkeypatch.setattr(tools, "_safe_get", lambda *a, **k: "ERROR: down")
     assert tools.fetch_pdf("https://example.com/x.pdf").startswith("ERROR")
+
+
+# --------------------------------------------------------------------------- #
+# agent: hard budget stop
+# --------------------------------------------------------------------------- #
+def test_hard_budget_blocks_api_calls():
+    a = agent.Agent("k", "m/x", budget=0.01, budget_hard=True)
+    a.api_cost = 0.05
+    with pytest.raises(agent.BudgetExceeded):
+        a._post({"model": "m/x"}, stream=True)
+
+
+def test_soft_budget_does_not_block(monkeypatch):
+    a = agent.Agent("k", "m/x", budget=0.01)  # warn-only
+    a.api_cost = 0.05
+    monkeypatch.setattr(agent.Agent, "_post_retry",
+                        lambda self, payload, stream, attempts: "resp")
+    assert a._post({"model": "m/x"}, stream=True) == "resp"
+
+
+def test_hard_budget_under_limit_passes(monkeypatch):
+    a = agent.Agent("k", "m/x", budget=1.00, budget_hard=True)
+    a.api_cost = 0.05
+    monkeypatch.setattr(agent.Agent, "_post_retry",
+                        lambda self, payload, stream, attempts: "resp")
+    assert a._post({"model": "m/x"}, stream=True) == "resp"
+
+
+# --------------------------------------------------------------------------- #
+# agent: provider failover
+# --------------------------------------------------------------------------- #
+def test_post_fails_over_to_second_model(monkeypatch):
+    a = _agent()
+    tried = []
+
+    def fake_retry(self, payload, stream, attempts):
+        tried.append(payload["model"])
+        if payload["model"] == "moonshotai/kimi-k2.7-code":
+            raise agent._ProviderDown("primary down")
+        return "resp-from-fallback"
+
+    monkeypatch.setattr(agent.Agent, "_post_retry", fake_retry)
+    monkeypatch.setattr(agent, "available_menu",
+                        lambda: [("moonshotai/kimi-k2.7-code", "x"),
+                                 ("anthropic/claude-sonnet-5", "y")])
+    out = a._post({"model": "moonshotai/kimi-k2.7-code"}, stream=True)
+    assert out == "resp-from-fallback"
+    assert tried == ["moonshotai/kimi-k2.7-code", "anthropic/claude-sonnet-5"]
+
+
+def test_post_no_failover_on_hard_error(monkeypatch):
+    a = _agent()
+
+    def fake_retry(self, payload, stream, attempts):
+        raise RuntimeError("OpenRouter 401: bad key")  # not _ProviderDown
+
+    monkeypatch.setattr(agent.Agent, "_post_retry", fake_retry)
+    with pytest.raises(RuntimeError, match="401"):
+        a._post({"model": "m/x"}, stream=True)
+
+
+def test_post_raises_when_fallback_also_dies(monkeypatch):
+    a = _agent()
+    monkeypatch.setattr(
+        agent.Agent, "_post_retry",
+        lambda self, payload, stream, attempts:
+        (_ for _ in ()).throw(agent._ProviderDown("down")))
+    monkeypatch.setattr(agent, "available_menu",
+                        lambda: [("a/b", "x"), ("c/d", "y")])
+    with pytest.raises(RuntimeError):
+        a._post({"model": "a/b"}, stream=True)
+
+
+# --------------------------------------------------------------------------- #
+# agent: sub-agent time limit + swarm clipping
+# --------------------------------------------------------------------------- #
+def test_spawn_stops_at_time_limit(monkeypatch):
+    a = _agent()
+
+    def boom(*args, **kwargs):
+        raise AssertionError("should not call the API past the deadline")
+
+    monkeypatch.setattr(agent.Agent, "_complete", boom)
+    out = a.spawn("investigate", timeout=-1)  # deadline already in the past
+    assert "time limit" in out
+
+
+def test_clip_finding():
+    assert agent._clip_finding("short") == "short"
+    assert agent._clip_finding(None) == "(worker returned nothing)"
+    clipped = agent._clip_finding("x" * (agent.SWARM_FINDING_CLIP + 500))
+    assert len(clipped) < agent.SWARM_FINDING_CLIP + 100
+    assert "clipped 500 chars" in clipped
+
+
+# --------------------------------------------------------------------------- #
+# agent: image input
+# --------------------------------------------------------------------------- #
+def test_run_turn_attaches_image_parts(monkeypatch, ws):
+    a = _agent()
+    a.checkpointer = None
+    monkeypatch.setattr(agent, "model_accepts_images", lambda m: True)
+    monkeypatch.setattr(agent.Agent, "_stream",
+                        lambda self: {"role": "assistant", "content": "ok"})
+    a.run_turn("what is this?", images=["data:image/png;base64,AAAA"])
+    user = [m for m in a.messages if m["role"] == "user"][-1]
+    assert isinstance(user["content"], list)
+    types_ = [p["type"] for p in user["content"]]
+    assert types_ == ["text", "image_url"]
+    assert user["content"][0]["text"] == "what is this?"
+
+
+def test_prune_strips_images_from_old_turns():
+    a = _agent()
+    img = [{"type": "text", "text": "old shot"},
+           {"type": "image_url", "image_url": {"url": "data:image/png;base64,AA"}}]
+    a.messages += [
+        {"role": "user", "content": list(img)},
+        {"role": "assistant", "content": "looked at it"},
+        {"role": "user", "content": list(img)},  # newest user turn keeps its image
+    ]
+    a.prune_context()
+    users = [m for m in a.messages if m["role"] == "user"]
+    assert isinstance(users[0]["content"], str)
+    assert "old shot" in users[0]["content"] and "image removed" in users[0]["content"]
+    assert isinstance(users[1]["content"], list)
+
+
+def test_msg_text_handles_parts_and_strings():
+    assert agent._msg_text("plain") == "plain"
+    assert agent._msg_text(None) == ""
+    assert agent._msg_text([{"type": "text", "text": "a"},
+                            {"type": "image_url", "image_url": {"url": "u"}}]) == "a "

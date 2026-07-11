@@ -11,8 +11,10 @@ Features
     todo_write/spawn_agent/spawn_agents (parallel read-only sub-agents)/
     spawn_swarm (plan → up to 10 parallel workers → merged report)/switch_model
   · autonomy: spawns its own sub-agents/swarms and switches its own model when the work warrants
-  · retry+backoff on transient API errors; auto-compaction near the context limit
-  · @file mentions inline file contents; Tab completes commands and paths
+  · retry+backoff on transient API errors, failover to a second model if a
+    provider dies; auto-compaction near the context limit
+  · @file mentions inline file contents (@image.png attaches images for vision
+    models); Tab completes commands and paths
   · project docs (KODE.md/AGENTS.md/CLAUDE.md) + live env auto-loaded into context
   · continuous autosave, resume, save/load; token + $ cost + budget tracking
 
@@ -26,6 +28,7 @@ Type /help inside for commands.
 from __future__ import annotations
 
 import argparse
+import base64
 import concurrent.futures
 import difflib
 import json
@@ -55,13 +58,14 @@ from rich.text import Text
 import checkpoint
 import tools
 
-__version__ = "0.5.0"
+__version__ = "0.6.0"
 API_URL = "https://openrouter.ai/api/v1/chat/completions"
 MODELS_URL = "https://openrouter.ai/api/v1/models"
 DEFAULT_MODEL = "moonshotai/kimi-k2.7-code"
 MAX_STEPS = 50
 SUBAGENT_STEPS = 20
 MAX_RETRIES = 5
+FAILOVER_RETRIES = 2    # attempts on the fallback model after the primary dies
 _CTX_ENV = os.environ.get("KODE_CONTEXT_LIMIT")  # explicit pin overrides the catalog
 CONTEXT_LIMIT = int(_CTX_ENV or "200000")        # fallback when the catalog is unknown
 SESSION_KEEP = 40  # cap on timestamped autosaves kept by prune
@@ -77,6 +81,8 @@ READONLY_TOOLS = {"read_file", "grep", "glob_files", "list_dir", "fetch_url",
 MAX_PARALLEL_AGENTS = 4
 MAX_SWARM = 10          # hard cap on swarm workers (cost guard)
 SWARM_DEFAULT_N = 6
+SUBAGENT_TIMEOUT = 300.0   # seconds of wall clock per worker (checked between steps)
+SWARM_FINDING_CLIP = 8000  # chars of each worker's findings fed to synthesis
 FILE_TOOLS = {"write_file", "edit_file", "multi_edit"}  # mutating, but not bash
 
 # Approval modes: how much the user reviews before anything runs.
@@ -160,6 +166,32 @@ def available_menu() -> list[tuple[str, str]]:
     return menu or MODEL_MENU
 
 
+class _ProviderDown(RuntimeError):
+    """One model exhausted its retries — a different model may still work."""
+
+
+def _fallback_model(failing: str) -> str | None:
+    """First menu model that isn't the one that just died."""
+    try:
+        for mid, _ in available_menu():
+            if mid != failing:
+                return mid
+    except Exception:  # noqa: BLE001
+        pass
+    return None
+
+
+def model_accepts_images(model_id: str) -> bool:
+    try:
+        for m in fetch_models():
+            if m["id"] == model_id:
+                mods = (m.get("architecture") or {}).get("input_modalities") or []
+                return "image" in mods
+    except Exception:  # noqa: BLE001
+        pass
+    return True  # unknown — let the API decide
+
+
 def _menu_block() -> str:
     lines = "\n".join(f"  - {mid}  — {desc}" for mid, desc in available_menu())
     return ("\nModels you can switch to or delegate to (use switch_model / the "
@@ -211,6 +243,13 @@ ROUTER_SYSTEM = (
 )
 
 
+def _msg_text(content) -> str:
+    """Plain text of message content that may be a string or a parts list."""
+    if isinstance(content, list):
+        return " ".join(p.get("text", "") for p in content if isinstance(p, dict))
+    return content or ""
+
+
 def _extract_json(text: str) -> dict:
     """Pull the first JSON object out of a model reply (tolerates code fences)."""
     m = re.search(r"\{.*\}", text, re.S)
@@ -241,6 +280,14 @@ def _extract_json_list(text: str) -> list[str]:
         elif isinstance(x, dict) and str(x.get("task", "")).strip():
             out.append(str(x["task"]).strip())
     return out
+
+
+def _clip_finding(text: str | None) -> str:
+    text = text or "(worker returned nothing)"
+    if len(text) <= SWARM_FINDING_CLIP:
+        return text
+    return (text[:SWARM_FINDING_CLIP]
+            + f"\n… [clipped {len(text) - SWARM_FINDING_CLIP} chars]")
 
 
 SWARM_PLAN_SYSTEM = (
@@ -487,15 +534,21 @@ def project_context(workspace: Path) -> str | None:
 # --------------------------------------------------------------------------- #
 # Agent
 # --------------------------------------------------------------------------- #
+class BudgetExceeded(RuntimeError):
+    """Raised before an API call once a hard budget is exhausted."""
+
+
 class Agent:
     def __init__(self, api_key: str, model: str, yolo: bool = False,
                  system: str | None = None, budget: float | None = None,
-                 auto_route: bool = False, mode: str | None = None):
+                 auto_route: bool = False, mode: str | None = None,
+                 budget_hard: bool = False):
         self.api_key = api_key
         self.model = model
         self.mode = "confirm"
         self._prev_mode = "confirm"  # what plan mode returns to on exit
         self.budget = budget
+        self.budget_hard = budget_hard
         self.auto_route = auto_route
         self.router_model = default_router_model()
         self.approved: set[str] = set()  # tools the user chose "always allow" for
@@ -617,9 +670,32 @@ class Agent:
         }
 
     def _post(self, payload: dict, stream: bool):
-        """POST with retry on transient failures (429 / 5xx / network)."""
+        """POST with retry on transient failures (429 / 5xx / network).
+
+        If one model exhausts its retries (provider outage), the request is
+        tried once more on the first *different* model in the menu. Hard
+        errors (400/401/…) are not failed over — they'd fail anywhere."""
+        if self.budget_hard and self.budget and self.cost_usd() >= self.budget:
+            raise BudgetExceeded(
+                f"hard budget ${self.budget:.2f} reached "
+                f"(${self.cost_usd():.4f} spent) — raise or clear it with /budget")
+        try:
+            return self._post_retry(payload, stream, MAX_RETRIES)
+        except _ProviderDown as e:
+            fb = _fallback_model(payload.get("model", ""))
+            if not fb:
+                raise RuntimeError(str(e)) from None
+            console.print(f"[yellow]⚠ {payload.get('model')} unreachable — "
+                          f"failing over to {fb} for this request[/yellow]")
+            try:
+                return self._post_retry({**payload, "model": fb},
+                                        stream, FAILOVER_RETRIES)
+            except _ProviderDown as e2:
+                raise RuntimeError(str(e2)) from None
+
+    def _post_retry(self, payload: dict, stream: bool, attempts: int):
         last_err = ""
-        for attempt in range(MAX_RETRIES):
+        for attempt in range(attempts):
             try:
                 resp = requests.post(API_URL, headers=self._headers(), json=payload,
                                      stream=stream, timeout=600)
@@ -633,10 +709,11 @@ class Agent:
                 else:
                     raise RuntimeError(f"OpenRouter {resp.status_code}: {resp.text[:500]}")
             wait = min(2 ** attempt, 20) + random.uniform(0, 0.5)
-            console.print(f"[dim]retry {attempt + 1}/{MAX_RETRIES} in {wait:.1f}s "
+            console.print(f"[dim]retry {attempt + 1}/{attempts} in {wait:.1f}s "
                           f"({last_err[:80]})[/dim]")
             time.sleep(wait)
-        raise RuntimeError(f"OpenRouter failed after {MAX_RETRIES} retries: {last_err}")
+        raise _ProviderDown(f"{payload.get('model')} failed after "
+                            f"{attempts} retries: {last_err}")
 
     def _account(self, usage: dict | None) -> None:
         if not usage:
@@ -868,6 +945,16 @@ class Agent:
         A later read of the same target supersedes earlier ones (dedupe); large
         read-type results beyond the recent window are elided. Both are safely
         re-fetchable, so this cheap pass makes full compaction rare."""
+        # Strip images from all but the newest user turn: they've served their
+        # purpose, cost tokens, and would 400 on a non-vision model after a
+        # /model switch.
+        last_user = max((i for i, m in enumerate(self.messages)
+                         if m.get("role") == "user"), default=-1)
+        for i, m in enumerate(self.messages):
+            if (m.get("role") == "user" and i != last_user
+                    and isinstance(m.get("content"), list)):
+                m["content"] = (_msg_text(m["content"])
+                                + "\n[image removed — re-attach with @file if needed]")
         meta: dict[str, tuple[str, str]] = {}
         for m in self.messages:
             if m.get("role") == "assistant":
@@ -940,7 +1027,8 @@ class Agent:
         console.print("[dim]compacted.[/dim]")
 
     # ---- one user turn ---------------------------------------------------- #
-    def run_turn(self, user_input: str) -> None:
+    def run_turn(self, user_input: str,
+                 images: list[str] | None = None) -> None:
         self.interrupted = False
         first_turn = not any(m["role"] == "user" for m in self.messages)
         if self.auto_route and not looks_like_followup(user_input, first_turn):
@@ -966,7 +1054,19 @@ class Agent:
         self.last_input = user_input
         if self.title is None and user_input.strip():
             self.title = user_input.strip().replace("\n", " ")[:50]
-        self.messages.append({"role": "user", "content": user_input})
+        if images:  # vision input: content becomes a parts list
+            self.messages.append({"role": "user", "content":
+                                  [{"type": "text", "text": user_input}]
+                                  + [{"type": "image_url",
+                                      "image_url": {"url": u}} for u in images]})
+            console.print(f"[dim]attached {len(images)} image"
+                          f"{'s' if len(images) != 1 else ''}[/dim]")
+            if not model_accepts_images(self.model):
+                console.print(f"[yellow]⚠ {self.model} doesn't take image input "
+                              f"— /model to switch (e.g. google/gemini-2.5-flash)"
+                              f"[/yellow]")
+        else:
+            self.messages.append({"role": "user", "content": user_input})
         steps = 0
         while True:
             if steps >= MAX_STEPS:
@@ -1003,8 +1103,15 @@ class Agent:
                     return
 
     # ---- sub-agents ------------------------------------------------------- #
-    def spawn(self, task: str, model: str | None = None) -> str:
-        """Run one read-only sub-agent to completion and return its answer."""
+    def spawn(self, task: str, model: str | None = None,
+              timeout: float | None = SUBAGENT_TIMEOUT) -> str:
+        """Run one read-only sub-agent to completion and return its answer.
+
+        The time limit is checked between steps; a single in-flight call is
+        already bounded by _post's request timeout, so total runtime is
+        roughly `timeout` + one request."""
+        deadline = (time.monotonic() + timeout) if timeout else None
+        last_seen = ""  # best partial answer if we hit the time limit
         sub = [
             {"role": "system", "content":
              "You are a focused read-only research sub-agent. Investigate using "
@@ -1019,8 +1126,13 @@ class Agent:
                 if t["function"]["name"] in READONLY_TOOLS]
         nudged = False
         for _ in range(SUBAGENT_STEPS):
+            if deadline and time.monotonic() > deadline:
+                return (f"(sub-agent hit the {int(timeout)}s time limit)"
+                        + (f"\nPartial findings:\n{last_seen}" if last_seen else ""))
             msg = self._complete(sub, spec, model=model)
             sub.append(msg)
+            if msg.get("content"):
+                last_seen = msg["content"]
             calls = msg.get("tool_calls") or []
             if not calls:
                 answer = (msg.get("content") or msg.get("reasoning") or "").strip()
@@ -1053,9 +1165,13 @@ class Agent:
         def work(i, spec):
             results[i] = self.spawn(spec.get("task", ""), model=spec.get("model"))
 
+        t0 = time.monotonic()
         with concurrent.futures.ThreadPoolExecutor(max_workers=len(tasks)) as ex:
-            futs = [ex.submit(work, i, t) for i, t in enumerate(tasks)]
-            concurrent.futures.wait(futs)
+            futs = {ex.submit(work, i, t): i for i, t in enumerate(tasks)}
+            for done, f in enumerate(concurrent.futures.as_completed(futs), 1):
+                console.print(f"  [dim]sub-agent {futs[f] + 1} done "
+                              f"({time.monotonic() - t0:.0f}s) — "
+                              f"{done}/{len(tasks)}[/dim]")
         return "\n\n".join(
             f"### sub-agent {i + 1}"
             + (f" [{t.get('model')}]" if t.get("model") else "")
@@ -1099,13 +1215,19 @@ class Agent:
                 f"{sub}\n\n(Part of a wider goal: {task[:300]} — answer ONLY "
                 f"your sub-task, concisely.)", model=model)
 
+        t0 = time.monotonic()
         with concurrent.futures.ThreadPoolExecutor(
                 max_workers=len(subtasks)) as ex:
-            concurrent.futures.wait(
-                [ex.submit(work, i, s) for i, s in enumerate(subtasks)])
+            futs = {ex.submit(work, i, s): i for i, s in enumerate(subtasks)}
+            for done, f in enumerate(concurrent.futures.as_completed(futs), 1):
+                console.print(f"  [dim]worker {futs[f] + 1} done "
+                              f"({time.monotonic() - t0:.0f}s) — "
+                              f"{done}/{len(subtasks)}[/dim]")
 
+        # Clip each worker's findings so ten chatty workers can't blow the
+        # synthesis model's context window.
         findings = "\n\n".join(
-            f"### worker {i + 1}: {s[:80]}\n{results[i]}"
+            f"### worker {i + 1}: {s[:80]}\n{_clip_finding(results[i])}"
             for i, s in enumerate(subtasks))
         synth = [
             {"role": "system", "content": SWARM_SYNTH_SYSTEM},
@@ -1558,7 +1680,7 @@ def sessions_meta() -> list[dict]:
             data = json.loads(p.read_text())
         except Exception:  # noqa: BLE001
             continue
-        first = next((m.get("content") for m in data.get("messages", [])
+        first = next((_msg_text(m.get("content")) for m in data.get("messages", [])
                       if m.get("role") == "user" and m.get("content")), "")
         out.append({
             "name": p.stem, "path": p, "mtime": p.stat().st_mtime,
@@ -1654,7 +1776,7 @@ def _replay_tail(agent: Agent, n: int = 6) -> None:
     """Show the last few messages so the user has context on resume."""
     tail = [m for m in agent.messages if m.get("role") in ("user", "assistant")][-n:]
     for m in tail:
-        content = m.get("content")
+        content = _msg_text(m.get("content"))
         if not content:
             continue
         who = "[bold]›[/bold]" if m["role"] == "user" else "[cyan]⏺[/cyan]"
@@ -1920,7 +2042,7 @@ HELP = """[bold cyan]kode commands[/bold cyan]
   [green]/compact[/green]           summarize history to reclaim context
   [green]/temp[/green] <0-2>        set sampling temperature
   [green]/cost[/green]              tokens + $ + context size
-  [green]/budget[/green] <usd>      warn once session cost passes this
+  [green]/budget[/green] <usd> [hard]  warn at this spend ('hard' = stop instead)
   [green]/export[/green] [file]     write the conversation to a markdown file
   [green]/save[/green] [name]       save this conversation
   [green]/sessions[/green] [prune]  list (or prune old) saved sessions
@@ -1929,7 +2051,7 @@ HELP = """[bold cyan]kode commands[/bold cyan]
   [green]/clear[/green]             reset the conversation
   [green]/exit[/green]              quit (or Ctrl-D)
 
-[dim]@path[/dim]  in a message inlines that file's contents (Tab completes paths).
+[dim]@path[/dim]  inlines that file's contents; @image.png attaches it for vision models.
 [dim]!cmd[/dim]   runs a shell command directly (no model turn, no tokens).
 [dim]Ctrl-C[/dim] during a reply stops it cleanly. Long turns auto-compact.
 Multi-line: end a line with [bold]\\[/bold] to keep typing; blank line sends."""
@@ -1964,7 +2086,7 @@ CMD_META = {
     "/cost": "tokens + $ this session",
     "/compact": "summarize history to save context",
     "/temp": "set sampling temperature",
-    "/budget": "set a spend warning",
+    "/budget": "set a spend warning or hard stop",
     "/export": "write the chat to a markdown file",
     "/save": "save this conversation",
     "/sessions": "list saved sessions",
@@ -2016,11 +2138,16 @@ class KodeCompleter(Completer):
                     yield Completion("@" + disp, start_position=-len(word))
 
 
-def expand_mentions(text: str) -> str:
-    """Append the contents of any @path files referenced in the message.
+_IMAGE_MIME = {".png": "image/png", ".jpg": "image/jpeg", ".jpeg": "image/jpeg",
+               ".gif": "image/gif", ".webp": "image/webp"}
+MAX_IMAGE_BYTES = 5 * 1024 * 1024  # OpenRouter rejects much larger data URLs
+
+
+def expand_mentions(text: str) -> tuple[str, list[str]]:
+    """Inline @path text files; return @image files as base64 data URLs.
 
     Requires whitespace/start before @ so emails (user@host) aren't matched."""
-    blocks, seen = [], set()
+    blocks, images, seen = [], [], set()
     for m in re.findall(r"(?:^|\s)@([\w./\-]+)", text):
         if m in seen:
             continue
@@ -2029,10 +2156,20 @@ def expand_mentions(text: str) -> str:
             p = tools._safe_path(m)
         except ValueError:
             continue
-        if p.is_file():
-            body = "\n".join(p.read_text(errors="replace").splitlines()[:400])
-            blocks.append(f"\n--- Contents of {m} ---\n{body}")
-    return text + ("\n" + "\n".join(blocks) if blocks else "")
+        if not p.is_file():
+            continue
+        ext = p.suffix.lower()
+        if ext in _IMAGE_MIME:
+            if p.stat().st_size > MAX_IMAGE_BYTES:
+                blocks.append(f"\n--- {m} skipped: image exceeds "
+                              f"{MAX_IMAGE_BYTES // (1024 * 1024)}MB ---")
+            else:
+                b64 = base64.b64encode(p.read_bytes()).decode()
+                images.append(f"data:{_IMAGE_MIME[ext]};base64,{b64}")
+            continue
+        body = "\n".join(p.read_text(errors="replace").splitlines()[:400])
+        blocks.append(f"\n--- Contents of {m} ---\n{body}")
+    return text + ("\n" + "\n".join(blocks) if blocks else ""), images
 
 
 def read_message(session: PromptSession) -> str:
@@ -2065,6 +2202,9 @@ def main() -> None:
                         help="auto-approve all writes/commands (--no-yolo forces off)")
     parser.add_argument("--budget", type=float, default=None,
                         help="warn once session cost exceeds this many USD")
+    parser.add_argument("--budget-hard", action=argparse.BooleanOptionalAction,
+                        dest="budget_hard", default=None,
+                        help="refuse further API calls once --budget is exhausted")
     parser.add_argument("--route", "--auto-route", action=argparse.BooleanOptionalAction,
                         dest="route", default=None,
                         help="auto-pick a model per prompt (cheap/thinking/default)")
@@ -2116,6 +2256,7 @@ def main() -> None:
 
     model = resolve(args.model, "model", DEFAULT_MODEL)
     budget = resolve(args.budget, "budget", None)
+    budget_hard = resolve(args.budget_hard, "budget_hard", False)
     auto_route = resolve(args.route, "auto_route", False)
 
     mode_cli = args.mode
@@ -2135,7 +2276,7 @@ def main() -> None:
         mode = "confirm"
 
     agent = Agent(api_key, model, mode=mode, budget=budget,
-                  auto_route=auto_route,
+                  budget_hard=budget_hard, auto_route=auto_route,
                   system=build_system_prompt(tools.WORKSPACE))
     agent.bash_allow = list(pcfg.get("bash_allow", []))
     slug = re.sub(r"[^a-zA-Z0-9]+", "-", str(tools.WORKSPACE)).strip("-")[-60:]
@@ -2333,7 +2474,9 @@ def main() -> None:
                 console.print(
                     f"[dim]{agent.prompt_tokens} in + {agent.completion_tokens} out "
                     f"= ${agent.cost_usd():.4f} · context {agent.last_prompt_tokens} tok"
-                    + (f" · budget ${agent.budget:.2f}" if agent.budget else "")
+                    + (f" · budget ${agent.budget:.2f}"
+                       + (" hard" if agent.budget_hard else "")
+                       if agent.budget else "")
                     + "[/dim]")
             elif cmd == "compact":
                 agent.compact()
@@ -2345,14 +2488,24 @@ def main() -> None:
                         console.print("[yellow]usage: /temp 0.6[/yellow]"); continue
                 console.print(f"[dim]temperature = {agent.temperature}[/dim]")
             elif cmd == "budget":
-                if rest.strip():
+                words = rest.split()
+                if words and words[0].lower() == "off":
+                    agent.budget = None; agent.budget_hard = False
+                    cfg.pop("budget", None); cfg.pop("budget_hard", None); save_config(cfg)
+                elif words:
                     try:
-                        agent.budget = float(rest.strip()); agent._budget_warned = False
-                        cfg["budget"] = agent.budget; save_config(cfg)
+                        agent.budget = float(words[0]); agent._budget_warned = False
+                        agent.budget_hard = (len(words) > 1
+                                             and words[1].lower() == "hard")
+                        cfg["budget"] = agent.budget
+                        cfg["budget_hard"] = agent.budget_hard; save_config(cfg)
                     except ValueError:
-                        console.print("[yellow]usage: /budget 5.00[/yellow]"); continue
+                        console.print("[yellow]usage: /budget 5.00 [hard] "
+                                      "| /budget off[/yellow]"); continue
                 console.print(f"[dim]budget = "
-                              f"{('$%.2f' % agent.budget) if agent.budget else 'none'}[/dim]")
+                              f"{('$%.2f' % agent.budget) if agent.budget else 'none'}"
+                              + (" (hard stop)" if agent.budget_hard else "")
+                              + "[/dim]")
             elif cmd == "export":
                 cmd_export(agent, rest)
             elif cmd == "save":
@@ -2421,7 +2574,8 @@ def _run_oneshot(agent: Agent, prompt: str, as_json: bool = False) -> None:
     agent.checkpointer and agent.checkpointer.snapshot("oneshot start")
     start = agent.session_start_ckpt
     try:
-        agent.run_turn(expand_mentions(prompt))
+        text, imgs = expand_mentions(prompt)
+        agent.run_turn(text, images=imgs)
     except Exception as e:  # noqa: BLE001
         if as_json:
             print(json.dumps({"error": f"{type(e).__name__}: {e}"}))
@@ -2497,7 +2651,8 @@ def _run_user_turn(agent: Agent, user: str) -> None:
         return
     t0 = time.time()
     try:
-        agent.run_turn(expand_mentions(user))
+        text, imgs = expand_mentions(user)
+        agent.run_turn(text, images=imgs)
         agent.autosave()
         if time.time() - t0 > 20:      # ring the terminal bell after a long turn
             sys.stdout.write("\a"); sys.stdout.flush()

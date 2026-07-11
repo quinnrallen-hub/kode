@@ -37,6 +37,7 @@ kode --auto                  # file edits auto-approved       (= --mode auto)
 kode --yolo                  # skip all confirmations (--no-yolo forces it off)
 kode --route                 # a router agent picks the model per prompt
 kode --budget 5              # warn once the session passes $5
+kode --budget 5 --budget-hard  # …or refuse further API calls past $5
 kode --resume                # resume the most recent session for this workspace
 kode --resume mytask         # resume a named session
 kode --list-sessions         # print saved sessions and exit
@@ -86,7 +87,10 @@ The agent manages its own compute. Given the right task it will, on its own:
   parallel read-only workers**: a cheap planner model splits the goal into
   independent angles, the workers investigate concurrently (optionally all on
   a cheap model for breadth), and a synthesis pass merges everything into one
-  de-duplicated report. Planning or synthesis failures degrade gracefully
+  de-duplicated report. Completions print live (`worker 3 done (41s) — 2/6`),
+  each worker has a 5-minute wall-clock budget, per-worker findings are
+  clipped before synthesis so a chatty swarm can't blow the context window,
+  and planning or synthesis failures degrade gracefully
   (single sub-agent / raw findings). Use it for codebase audits, system
   mapping, or surveying a design space; `spawn_agents` is better when you
   already know the exact 2–4 questions.
@@ -148,7 +152,7 @@ per model family (0.6 for Kimi/reasoning models; `/temp` to tune).
 | `/temp <0-2>`       | set sampling temperature                                      |
 | `/cost`             | tokens + $ + context size this session                        |
 | `/usage`            | cost per day / per model across all sessions                  |
-| `/budget <usd>`     | warn once session cost passes this                            |
+| `/budget <usd> [hard]` | warn at this spend — `hard` stops API calls instead; `/budget off` clears |
 | `/export [file]`    | write the conversation to a markdown file                     |
 | `/save [name]`      | save conversation                                             |
 | `/sessions [prune]` | list (or prune old) saved sessions                            |
@@ -158,6 +162,9 @@ per model family (0.6 for Kimi/reasoning models; `/temp` to tune).
 | `/exit`, Ctrl-D     | quit                                                          |
 
 Also: `@src/app.py` in a message inlines that file (Tab completes paths);
+`@screenshot.png` attaches the image for vision models (png/jpg/gif/webp, ≤5MB
+— kode warns if the current model can't see images, and older images are
+dropped from history automatically so a later model switch never breaks);
 `!cmd` runs a shell command directly with no model turn; end a line with `\`
 for multi-line input; Ctrl-C stops a reply cleanly.
 
@@ -206,7 +213,15 @@ for multi-line input; Ctrl-C stops a reply cleanly.
   download size is capped.
 - **Path sandbox** — file tools can't escape the workspace; big-file reads are
   refused with a pointer to slice with `offset`/`limit`.
-- **Resilient API** — retry with backoff on 429/5xx/network errors; internal
+- **Hard budget stop** — `/budget 5 hard` (or `--budget-hard`) refuses every
+  further API call — main turns, sub-agents, swarms, the router — once the
+  session passes the limit. The soft form just warns.
+- **Sub-agent time limit** — every sub-agent/swarm worker has a wall-clock
+  budget (5 min) on top of its step cap, so a runaway worker can't burn money
+  silently; partial findings are returned when the limit hits.
+- **Resilient API** — retry with backoff on 429/5xx/network errors, then
+  automatic failover to the next model in the menu if a provider is down
+  (hard errors like a bad key are *not* failed over); internal
   completions (sub-agents, router, compaction) stream under the hood because
   OpenRouter's non-streaming endpoint can stall indefinitely on some
   providers. Ctrl-C is interrupt-safe: history is repaired so orphaned tool
@@ -245,8 +260,9 @@ global `~/.kode/config.json` (what the wizard writes) → built-in default. So
 `kode --model X` always overrides the saved default, and `--no-yolo` overrides
 a config that turned yolo on.
 
-Per-project config can set `model`, `mode`, `budget`, `auto_route`, and
-`bash_allow` (the `/allow` list is saved there automatically).
+Per-project config can set `model`, `mode`, `budget`, `budget_hard`,
+`auto_route`, and `bash_allow` (the `/allow` list is saved there
+automatically).
 
 | Env var                  | Default          | Effect                                              |
 |--------------------------|------------------|-----------------------------------------------------|
@@ -262,8 +278,11 @@ Per-project config can set `model`, `mode`, `budget`, `auto_route`, and
 ## Development
 
 ```bash
-python3 -m pytest test_kode.py -q      # 99 tests, no network needed
+python3 -m pytest test_kode.py -q      # full offline suite, no network needed
 ```
+
+CI runs the same suite on every push (`.github/workflows/test.yml`).
+Licensed under [MIT](LICENSE).
 
 - `agent.py` — REPL, streaming OpenRouter client, tool loop, modes, routing, swarms, sessions
 - `tools.py` — tool implementations + JSON schemas advertised to the model
