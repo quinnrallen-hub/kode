@@ -45,6 +45,8 @@ Adding a tool means: function + `TOOL_FUNCS` entry + `TOOLS_SPEC` schema, plus i
 
 **`checkpoint.py`**: a shadow git repo (`GIT_DIR` = `~/.kode/shadow/<sha1-of-workspace-path>`, `GIT_WORK_TREE` = the workspace, committer `kode@localhost`) so `/rewind`/`/revert` never touch the user's real git history; the workspace's own `.gitignore` is honored plus coarse excludes (`node_modules`, `.venv`, …). Auto-disabled when the workspace is home or filesystem root — *unless* that directory is itself a git repo (`KODE_ALLOW_BROAD_CKPT=1` also forces it on). `snapshot()` returns `None` when nothing changed; `setup()` runs `git gc --auto` once per session so the shadow repo can't grow unbounded. `reset()` is `git reset --hard`: it removes tracked files added since the snapshot but never touches untracked/excluded ones.
 
+**UI conventions**: the global `console` is `Console(highlight=False)` — all color comes from explicit styles, never rich's auto-highlighter; keep it that way or dim gutter output turns garish. Literal `[...]` in markup strings must be escaped (`\\[n]`) or rich silently eats them. The prompt (`read_message(session, agent)`) is mode-colored and the `PromptSession` has a persistent bottom toolbar from `_toolbar_factory(agent)` — the toolbar callable re-runs on every render and must never raise or block (it reads cached fields like `_ctx_limit` only). Tool calls render with a category glyph from `_tool_ui()`.
+
 **Config precedence** (resolved in `main()`): CLI flag → `.kode.toml`/`.kode.json` in the workspace → `~/.kode/config.json` → built-in default.
 
 ## Testing conventions

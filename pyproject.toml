@@ -1,6 +1,6 @@
 [project]
 name = "kode"
-version = "0.6.0"
+version = "0.7.0"
 description = "A TUI agentic coding tool powered by OpenRouter"
 license = {file = "LICENSE"}
 requires-python = ">=3.11"

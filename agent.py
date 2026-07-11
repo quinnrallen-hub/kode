@@ -45,9 +45,11 @@ from pathlib import Path
 import requests
 from prompt_toolkit import PromptSession
 from prompt_toolkit.completion import Completer, Completion
+from prompt_toolkit.formatted_text import HTML
 from prompt_toolkit.history import FileHistory
 from prompt_toolkit.key_binding import KeyBindings
 from prompt_toolkit.styles import Style
+from rich import box
 from rich.console import Console, Group
 from rich.live import Live
 from rich.markdown import Markdown
@@ -58,7 +60,7 @@ from rich.text import Text
 import checkpoint
 import tools
 
-__version__ = "0.6.0"
+__version__ = "0.7.0"
 API_URL = "https://openrouter.ai/api/v1/chat/completions"
 MODELS_URL = "https://openrouter.ai/api/v1/models"
 DEFAULT_MODEL = "moonshotai/kimi-k2.7-code"
@@ -132,7 +134,9 @@ MODEL_MENU = [
     ("meta-llama/llama-4-maverick", "dirt-cheap long-context utility model"),
 ]
 
-console = Console()
+# highlight=False: no auto-coloring of numbers/paths in plain prints — the UI
+# sets its own styles, and highlighter noise makes dim gutter output garish.
+console = Console(highlight=False)
 
 BASE_PROMPT = """You are kode, a terminal coding agent operating inside the user's \
 workspace directory. You solve real software tasks using the provided tools.
@@ -887,7 +891,14 @@ class Agent:
 
         # Print the final answer once, as Markdown (Live was transient).
         if reasoning.strip():
-            console.print(Text(reasoning.strip(), style="dim italic"))
+            rl = reasoning.strip().splitlines()
+            if len(rl) > 12:  # cap the noise; the full text stays in history
+                console.print(Text(f"✻ thinking — {len(rl) - 12} earlier lines "
+                                   f"hidden", style="dim italic"))
+                rl = rl[-12:]
+            else:
+                console.print(Text("✻ thinking", style="dim italic"))
+            console.print(Text("\n".join(rl), style="dim italic"))
         if content.strip():
             console.print(Markdown(content))
 
@@ -1312,8 +1323,8 @@ class Agent:
     def _confirm(self, tool: str, preview) -> tuple[bool, str]:
         console.print(preview)
         ans = console.input(
-            "[bold]approve?[/bold] [green]y[/green]/[cyan]a[/cyan]lways/"
-            "[red]n[/red]  (or type feedback) › "
+            "  [bold]↳ apply?[/bold]  [green]y[/green]es · [cyan]a[/cyan]lways · "
+            "[red]n[/red]o · or type feedback [dim]›[/dim] "
         ).strip()
         low = ans.lower()
         if low in ("y", "yes", ""):
@@ -1401,6 +1412,25 @@ class Agent:
 # --------------------------------------------------------------------------- #
 # Rendering
 # --------------------------------------------------------------------------- #
+def _tool_ui(name: str) -> tuple[str, str]:
+    """(glyph, color) per tool category, so the transcript scans at a glance."""
+    if name in ("write_file", "edit_file", "multi_edit"):
+        return "✎", "yellow"
+    if name == "bash":
+        return "❯", "yellow"
+    if name in ("read_file", "list_dir", "glob_files", "grep"):
+        return "⌕", "cyan"
+    if name.startswith("fetch_") or name == "web_search":
+        return "⇣", "blue"
+    if name.startswith("spawn_"):
+        return "✦", "magenta"
+    if name == "switch_model":
+        return "⇄", "magenta"
+    if name == "todo_write":
+        return "☰", "green"
+    return "●", "cyan"
+
+
 def _render_tool_call(name: str, args: dict) -> None:
     if name == "bash":
         detail = ("[bg] " if args.get("background") else "") + args.get("command", "")
@@ -1447,8 +1477,9 @@ def _render_tool_call(name: str, args: dict) -> None:
         detail = f"{len(args.get('todos', []))} items"
     else:
         detail = ""
-    console.print(Text.assemble(("\n● ", "cyan"), (name, "bold"),
-                                ("  " + detail, "cyan dim")))
+    glyph, color = _tool_ui(name)
+    console.print(Text.assemble((f"\n{glyph} ", color), (name, f"bold {color}"),
+                                ("  " + detail, "dim")))
 
 
 # Tools whose output is worth previewing a few lines of; others get a 1-line summary.
@@ -1468,23 +1499,29 @@ def _render_tool_result(name: str, result: str) -> None:
     lines = result.splitlines() or ["(no output)"]
     if name in _CONTENT_TOOLS:
         show = lines[:6]
-        console.print(f"  [dim]⎿ {show[0][:150]}[/dim]")
+        head = Text(f"  ⎿ {show[0][:150]}", style="dim")
+        if len(lines) > 1:
+            head.append(f"  ({len(lines)} lines)", style="dim italic")
+        console.print(head)
         for ln in show[1:]:
-            console.print(f"  [dim]  {ln[:150]}[/dim]")
+            console.print(f"  [dim]│ {ln[:150]}[/dim]")
         if len(lines) > 6:
-            console.print(f"  [dim]  … +{len(lines) - 6} more lines[/dim]")
+            console.print(f"  [dim]⋮ +{len(lines) - 6} more[/dim]")
     else:
-        console.print(f"  [green dim]⎿ {lines[0][:150]}[/green dim]")
+        console.print(f"  [green dim]⎿ ✓ {lines[0][:150]}[/green dim]")
 
 
 def _render_todos() -> None:
-    mark = {"done": "[green]✓[/green]", "in_progress": "[yellow]▸[/yellow]",
-            "pending": "[dim]○[/dim]"}
-    console.print("  [bold]plan[/bold]")
+    total = len(tools.TODOS)
+    done = sum(1 for t in tools.TODOS if t["status"] == "done")
+    console.print(f"\n  [bold green]☰ plan[/bold green] [dim]{done}/{total}[/dim]")
     for t in tools.TODOS:
-        style = "dim" if t["status"] == "done" else ""
-        txt = f"[{style}]{t['content']}[/{style}]" if style else t["content"]
-        console.print(f"    {mark.get(t['status'], '○')} {txt}")
+        if t["status"] == "done":
+            console.print(f"    [green]✓[/green] [dim strike]{t['content']}[/dim strike]")
+        elif t["status"] == "in_progress":
+            console.print(f"    [yellow]▸[/yellow] [bold]{t['content']}[/bold]")
+        else:
+            console.print(f"    [dim]○ {t['content']}[/dim]")
 
 
 def _diff_text(old: str, new: str, path: str) -> Text:
@@ -2019,42 +2056,46 @@ def cmd_usage(agent: Agent) -> None:
 
 
 HELP = """[bold cyan]kode commands[/bold cyan]
-  [green]/help[/green]              this help
-  [green]/setup[/green]             re-run the first-time setup wizard
-  [green]/key[/green] [sk-or-…]     set/validate your OpenRouter key (saved to ~/.kode/key)
-  [green]/init[/green]              scan the project and add it to context
-  [green]/model[/green] [id|filter]  switch model (blank/filter = browse catalog)
-  [green]/route[/green]             toggle router agent (a cheap model picks per prompt)
-  [green]/tools[/green]             list tools the model can call
-  [green]/mode[/green] [name]       show / set approval mode: confirm · auto · plan · yolo
-  [green]/auto[/green]              toggle auto mode (file edits auto-approved)
-  [green]/plan[/green]              toggle plan mode (read-only: research + propose a plan)
-  [green]/yolo[/green]              toggle YOLO mode (skip all confirmations)
-  [green]/undo[/green]              revert the last file write/edit
-  [green]/diff[/green]              show all file changes this session
-  [green]/rewind[/green] [n]        undo last n turns: restore files + conversation
-  [green]/revert[/green]            discard all of this session's file changes
-  [green]/retry[/green] [model]     re-run the last turn (optionally on another model)
-  [green]/jobs[/green] [kill <pid>] list / kill background bash jobs
-  [green]/allow[/green] <prefix>    auto-approve bash commands starting with prefix
-  [green]/usage[/green]             cost per day / per model across sessions
-  [green]/todos[/green]             re-show the current task todo list
-  [green]/compact[/green]           summarize history to reclaim context
-  [green]/temp[/green] <0-2>        set sampling temperature
-  [green]/cost[/green]              tokens + $ + context size
-  [green]/budget[/green] <usd> [hard]  warn at this spend ('hard' = stop instead)
-  [green]/export[/green] [file]     write the conversation to a markdown file
-  [green]/save[/green] [name]       save this conversation
-  [green]/sessions[/green] [prune]  list (or prune old) saved sessions
-  [green]/resume[/green] [#|name]   resume a session (blank = pick from a list)
-  [green]/load[/green] <name>       restore a saved conversation
-  [green]/clear[/green]             reset the conversation
-  [green]/exit[/green]              quit (or Ctrl-D)
+
+[bold]models[/bold]
+  [green]/model[/green] \\[id|filter]  switch model (blank/filter = browse catalog)
+  [green]/route[/green]              toggle router agent (a cheap model picks per prompt)
+  [green]/temp[/green] <0-2>         set sampling temperature
+
+[bold]approval modes[/bold]
+  [green]/mode[/green] \\[name]        show / set: confirm · auto · plan · yolo
+  [green]/auto[/green]               toggle auto (file edits auto-approved)
+  [green]/plan[/green]               toggle plan (read-only: research + propose)
+  [green]/yolo[/green]               toggle YOLO (skip all confirmations)
+  [green]/allow[/green] <prefix>     auto-approve bash commands with this prefix
+
+[bold]files & rollback[/bold]
+  [green]/undo[/green]               revert the last file write/edit
+  [green]/diff[/green]               show all file changes this session
+  [green]/rewind[/green] \\[n]         undo last n turns: files + conversation
+  [green]/revert[/green]             discard all of this session's file changes
+  [green]/retry[/green] \\[model]      re-run the last turn (optionally elsewhere)
+  [green]/jobs[/green] \\[kill <pid>]  list / kill background bash jobs
+
+[bold]cost & context[/bold]
+  [green]/cost[/green]               tokens + $ + context size
+  [green]/usage[/green]              cost per day / per model across sessions
+  [green]/budget[/green] <usd> \\[hard]  warn at this spend ('hard' = stop) · /budget off
+  [green]/compact[/green]            summarize history to reclaim context
+  [green]/todos[/green]              re-show the current task list
+
+[bold]sessions[/bold]
+  [green]/save[/green] \\[name] · [green]/load[/green] <name> · [green]/sessions[/green] \\[prune] · [green]/resume[/green] \\[#|name]
+  [green]/export[/green] \\[file]      write the conversation to a markdown file
+  [green]/clear[/green]              reset the conversation
+
+[bold]setup[/bold]
+  [green]/setup[/green] · [green]/key[/green] \\[sk-or-…] · [green]/init[/green] · [green]/tools[/green] · [green]/help[/green] · [green]/exit[/green]
 
 [dim]@path[/dim]  inlines that file's contents; @image.png attaches it for vision models.
 [dim]!cmd[/dim]   runs a shell command directly (no model turn, no tokens).
 [dim]Ctrl-C[/dim] during a reply stops it cleanly. Long turns auto-compact.
-Multi-line: end a line with [bold]\\[/bold] to keep typing; blank line sends."""
+Multi-line: end a line with [bold]\\\\[/bold] to keep typing; blank line sends."""
 
 
 # --------------------------------------------------------------------------- #
@@ -2172,13 +2213,48 @@ def expand_mentions(text: str) -> tuple[str, list[str]]:
     return text + ("\n" + "\n".join(blocks) if blocks else ""), images
 
 
-def read_message(session: PromptSession) -> str:
-    first = session.prompt("\n› ")
+# prompt_toolkit ansi color per mode (MODE_INFO holds the rich names).
+_PT_MODE_COLOR = {"confirm": "ansigreen", "auto": "ansiyellow",
+                  "plan": "ansicyan", "yolo": "ansired"}
+
+
+def _prompt_marker(agent: Agent) -> HTML:
+    color = _PT_MODE_COLOR.get(agent.mode, "ansigreen")
+    return HTML(f'\n<b><style fg="{color}">❯</style></b> ')
+
+
+def _toolbar_factory(agent: Agent):
+    """Persistent status bar under the prompt: model · mode · spend · context."""
+    def get():
+        try:
+            model = ("auto-route" if agent.auto_route
+                     else agent.model.split("/")[-1])
+            color = _PT_MODE_COLOR.get(agent.mode, "ansigreen")
+            cost = f"${agent.cost_usd():.3f}"
+            if agent.budget:
+                cost += (f" / ${agent.budget:.2f}"
+                         + (" hard" if agent.budget_hard else ""))
+            if agent._ctx_limit and agent.last_prompt_tokens:
+                pct = min(100, 100 * agent.last_prompt_tokens // agent._ctx_limit)
+                ctx = f"ctx {pct}%"
+            else:
+                ctx = f"ctx {agent.last_prompt_tokens or 0}"
+            return HTML(
+                f'  <b>{model}</b>'
+                f'  ·  <style fg="{color}">● {agent.mode}</style>'
+                f'  ·  {cost}  ·  {ctx}')
+        except Exception:  # noqa: BLE001 — a status bar must never crash input
+            return ""
+    return get
+
+
+def read_message(session: PromptSession, agent: Agent) -> str:
+    first = session.prompt(_prompt_marker(agent))
     if not first.endswith("\\"):
         return first
     buf = [first.rstrip("\\")]
     while True:
-        nxt = session.prompt("  ")
+        nxt = session.prompt(HTML('<style fg="ansibrightblack">⋮</style> '))
         if nxt == "":
             break
         buf.append(nxt.rstrip("\\"))
@@ -2305,6 +2381,7 @@ def main() -> None:
         "completion-menu.meta.completion": "bg:#1c1c1c #6c6c6c",
         "completion-menu.meta.completion.current": "bg:#008787 #ffffff",
         "scrollbar.background": "bg:#3a3a3a",
+        "bottom-toolbar": "bg:#1c1c1c #8a8a8a noreverse",
     })
 
     kb = KeyBindings()
@@ -2326,7 +2403,8 @@ def main() -> None:
     session = PromptSession(
         history=FileHistory(os.path.expanduser("~/.kode_history")),
         completer=KodeCompleter(), complete_while_typing=True,
-        key_bindings=kb, style=menu_style)
+        key_bindings=kb, style=menu_style,
+        bottom_toolbar=_toolbar_factory(agent))
 
     resumed = None
     if args.resume is not None:
@@ -2340,25 +2418,40 @@ def main() -> None:
                           f"({args.resume}); starting fresh[/yellow]")
 
     mcolor = MODE_INFO[agent.mode][0]
-    mode = f"[{mcolor}]● {agent.mode}[/{mcolor}]"
     model_label = ("auto-route" if agent.auto_route else
                    agent.model.split("/")[-1])
     ck_on = agent.checkpointer and agent.checkpointer.enabled
-    ckpt = "[green]● checkpoints[/green]" if ck_on else "[dim]○ no checkpoints[/dim]"
     n_saved = len(sessions_meta())
 
-    rows = [
-        f"[bold cyan]▐ kode[/bold cyan] [dim]v{__version__}[/dim]",
-        f"[dim]dir  [/dim] {tools.WORKSPACE}",
-        f"[dim]model[/dim] [green]{model_label}[/green]   {mode}   {ckpt}",
-    ]
-    if not ck_on and agent.checkpointer and agent.checkpointer.reason:
-        rows.append(f"[dim]○ {agent.checkpointer.reason}[/dim]")
+    home = str(Path.home())
+    wsdir = str(tools.WORKSPACE)
+    if wsdir.startswith(home):
+        wsdir = "~" + wsdir[len(home):]
+    grid = Table.grid(padding=(0, 2))
+    grid.add_column(style="dim", justify="right", no_wrap=True)
+    grid.add_column()
+    grid.add_row("model", f"[bold green]{model_label}[/bold green]"
+                 + (f"   [dim]temp {agent.temperature}[/dim]" if not agent.auto_route else ""))
+    grid.add_row("mode", f"[{mcolor}]● {agent.mode}[/{mcolor}]"
+                 f"  [dim]{MODE_INFO[agent.mode][1]}[/dim]")
+    grid.add_row("dir", wsdir)
+    ckpt_row = ("[green]● on[/green]  [dim]/rewind · /diff · /revert[/dim]" if ck_on
+                else "[dim]○ off"
+                + (f" — {agent.checkpointer.reason}" if agent.checkpointer
+                   and agent.checkpointer.reason else "") + "[/dim]")
+    grid.add_row("ckpts", ckpt_row)
+    if agent.budget:
+        grid.add_row("budget", f"${agent.budget:.2f}"
+                     + (" [red]hard stop[/red]" if agent.budget_hard else " [dim]warn[/dim]"))
     if n_saved:
-        rows.append(f"[dim]{n_saved} saved session(s) · /resume to reopen[/dim]")
-    rows.append("[dim]/help for commands · @file to attach · Ctrl-C stop · Ctrl-D quit[/dim]")
-    console.print(Panel("\n".join(rows), border_style="cyan",
-                        padding=(0, 2), title="", expand=False))
+        grid.add_row("saved", f"[dim]{n_saved} session{'s' if n_saved != 1 else ''}"
+                     f" · /resume to reopen[/dim]")
+    console.print(Panel(
+        Group(Text.assemble(("◆ kode ", "bold cyan"), (f"v{__version__}", "dim")),
+              Text(), grid, Text(),
+              Text("/help commands · @file attach (@img.png for vision) · "
+                   "!cmd shell · Ctrl-C stop · Ctrl-D quit", style="dim")),
+        border_style="cyan", box=box.ROUNDED, padding=(0, 2), expand=False))
 
     broad = broad_workspace_label(tools.WORKSPACE)
     if broad:
@@ -2379,7 +2472,7 @@ def main() -> None:
 
     while True:
         try:
-            user = read_message(session).strip()
+            user = read_message(session, agent).strip()
         except (EOFError, KeyboardInterrupt):
             agent.repair_history()
             agent.autosave()
@@ -2471,13 +2564,21 @@ def main() -> None:
                     tbl.add_row(f"[cyan]{f['name']}[/cyan]", f["description"])
                 console.print(tbl)
             elif cmd == "cost":
+                lim = agent._ctx_limit
+                bar = ""
+                if lim and agent.last_prompt_tokens:
+                    pct = min(100, 100 * agent.last_prompt_tokens // lim)
+                    filled = pct // 10
+                    bar = (f"  [cyan]{'█' * filled}[/cyan]"
+                           f"[bright_black]{'░' * (10 - filled)}[/bright_black]"
+                           f" {pct}% of {lim // 1000}k")
                 console.print(
                     f"[dim]{agent.prompt_tokens} in + {agent.completion_tokens} out "
                     f"= ${agent.cost_usd():.4f} · context {agent.last_prompt_tokens} tok"
                     + (f" · budget ${agent.budget:.2f}"
                        + (" hard" if agent.budget_hard else "")
                        if agent.budget else "")
-                    + "[/dim]")
+                    + "[/dim]" + bar)
             elif cmd == "compact":
                 agent.compact()
             elif cmd == "temp":
@@ -2570,7 +2671,7 @@ def _run_oneshot(agent: Agent, prompt: str, as_json: bool = False) -> None:
     """Run a single turn and exit — for `kode -p` and piped input."""
     global console
     if as_json:  # keep stdout clean for the JSON; stream UI goes to stderr
-        console = Console(stderr=True)
+        console = Console(stderr=True, highlight=False)
     agent.checkpointer and agent.checkpointer.snapshot("oneshot start")
     start = agent.session_start_ckpt
     try:
@@ -2650,15 +2751,23 @@ def _run_user_turn(agent: Agent, user: str) -> None:
                       "OpenRouter key[/yellow]")
         return
     t0 = time.time()
+    tok0, cost0 = agent.completion_tokens, agent.cost_usd()
     try:
         text, imgs = expand_mentions(user)
         agent.run_turn(text, images=imgs)
         agent.autosave()
         if time.time() - t0 > 20:      # ring the terminal bell after a long turn
             sys.stdout.write("\a"); sys.stdout.flush()
-        console.print(f"[dim]— {agent.completion_tokens} out tok · "
-                      f"${agent.cost_usd():.4f} · ctx {agent.last_prompt_tokens} "
-                      f"· autosaved —[/dim]")
+        if agent._ctx_limit and agent.last_prompt_tokens:
+            pct = min(100, 100 * agent.last_prompt_tokens // agent._ctx_limit)
+            ctx = f"ctx {pct}%"
+        else:
+            ctx = f"ctx {agent.last_prompt_tokens} tok"
+        console.print(
+            f"[dim]⏱ {time.time() - t0:.0f}s · "
+            f"+{agent.completion_tokens - tok0} tok · "
+            f"+${agent.cost_usd() - cost0:.4f} (session ${agent.cost_usd():.4f}) · "
+            f"{ctx} · autosaved[/dim]")
     except KeyboardInterrupt:
         agent.repair_history()
         agent.autosave()

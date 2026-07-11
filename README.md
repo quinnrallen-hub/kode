@@ -8,6 +8,13 @@ diff + confirmation gate before anything touches disk. It manages its own
 compute: it can switch its own model mid-task, delegate to sub-agents, or fan
 a broad goal out to a swarm of parallel workers.
 
+The UI stays out of your way: a persistent status bar under the prompt shows
+`model · mode · spend · context %` at all times, the `❯` prompt is colored by
+approval mode, every tool call is glyph-coded by category (`⌕` read · `✎`
+write · `❯` bash · `⇣` network · `✦` agents), the task plan renders as a live
+checklist with progress, and each turn ends with a one-line footer — elapsed
+time, tokens and dollars *this turn*, session total, and context usage.
+
 ## Quick start
 
 ```bash
